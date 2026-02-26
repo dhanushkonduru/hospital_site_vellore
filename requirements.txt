@@ -1,0 +1,12 @@
+geopandas
+rasterio
+numpy
+scipy
+scikit-learn
+tensorflow
+keras
+osmnx
+matplotlib
+pyproj
+shapely
+rasterstats
