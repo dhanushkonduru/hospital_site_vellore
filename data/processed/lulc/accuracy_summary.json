@@ -1,0 +1,20 @@
+{
+  "2013": {
+    "overall_accuracy_pct": 76.9,
+    "kappa": 0.0,
+    "built_up_pct": 0.0,
+    "built_up_km2": 0.0
+  },
+  "2019": {
+    "overall_accuracy_pct": 99.5,
+    "kappa": 0.9927,
+    "built_up_pct": 0.3,
+    "built_up_km2": 1.5
+  },
+  "2024": {
+    "overall_accuracy_pct": 98.9,
+    "kappa": 0.9748,
+    "built_up_pct": 0.0,
+    "built_up_km2": 0.0
+  }
+}

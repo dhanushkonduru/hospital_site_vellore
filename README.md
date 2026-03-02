@@ -1,7 +1,6 @@
 # Hospital Site Suitability Prediction — Vellore, Tamil Nadu
 
-> **IEEE Conference Paper Project**
-> Integrated CA-ANN urban growth modelling + AHP multi-criteria suitability analysis
+> Integrated CA-ANN urban growth modelling + AHP multi-criteria suitability analysis  
 > to identify optimal hospital locations for Vellore's 2030–2035 growth horizon.
 
 ---
@@ -29,22 +28,23 @@ hospital_site_vellore/
 │   │   └── vlr2024/          Landsat 9  — 08 Dec 2024
 │   └── processed/
 │       ├── vellore_boundary.gpkg
-│       ├── vellore_tight_bbox.gpkg
 │       ├── hospitals_osm.gpkg        123 healthcare facilities
 │       ├── roads/                    59,081 OSM road edges
-│       ├── lulc_production/          FINAL LULC rasters (2013/2019/2024)
-│       ├── ca_ann/                   Growth predictions (2030/2035)
+│       ├── lulc_production/          LULC rasters (2013 / 2019 / 2024)
+│       ├── ca_ann/                   Growth predictions (2030 / 2035)
 │       ├── ahp/                      Suitability criteria + score rasters
 │       └── sites/                    candidate_sites.gpkg (top 5 sites)
-├── maps/                             15 production-quality maps (200 DPI)
+├── maps/                             Production-quality maps (200 DPI)
+├── notebooks/                        Exploratory notebooks
+├── paper/                            IEEE paper draft (.docx)
 ├── src/
-│   ├── 01_setup_study_area.py        Stage 0: Download infrastructure data
+│   ├── 01_setup_study_area.py        Stage 0: Download boundaries + OSM data
 │   ├── 02_lulc_classification.py     Stage 1: Random Forest LULC classifier
 │   ├── 03_ca_ann_growth.py           Stage 2: CA-ANN urban growth model
 │   ├── 04_ahp_suitability.py         Stage 3: AHP multi-criteria analysis
 │   └── 05_site_recommendation.py     Stage 4: Site ranking + validation
-├── paper/                            IEEE paper draft (.docx)
-└── venv/                             Python virtual environment
+├── requirements.txt
+└── README.md
 ```
 
 ---
@@ -56,7 +56,7 @@ Landsat 8/9 Imagery (2013, 2019, 2024)
           │
           ▼
    Stage 1 — LULC Classification
-   Random Forest (500 trees, 12 spectral features)
+   Random Forest · 500 trees · 12 spectral features
    4 classes: Built-up / Vegetation / Water / Bare Land
    Kappa: 0.46 – 0.76
           │
@@ -64,7 +64,7 @@ Landsat 8/9 Imagery (2013, 2019, 2024)
    Stage 2 — CA-ANN Urban Growth Model
    5 spatial drivers → ANN [5→64→32→16→1] → transition probability
    CA simulation → predicted LULC 2030, 2035
-   New built-up by 2035: 45,255 pixels (~40.7 km²)
+   New built-up by 2035: 45,255 px (~40.7 km²)
           │
           ▼
    Stage 3 — AHP Suitability Analysis
@@ -79,22 +79,25 @@ Landsat 8/9 Imagery (2013, 2019, 2024)
 
 ---
 
-## Reproducing the Results
+## Quick Start
 
 ```bash
 # 1. Activate environment
 cd hospital_site_vellore
 source venv/bin/activate
 
-# 2. Run each stage in order
-python src/01_setup_study_area.py     # ~5 min (downloads OSM data)
+# 2. Install dependencies
+pip install -r requirements.txt
+
+# 3. Run pipeline in order
+python src/01_setup_study_area.py     # ~5 min  (downloads OSM data)
 python src/02_lulc_classification.py  # ~10 min
 python src/03_ca_ann_growth.py        # ~15 min
 python src/04_ahp_suitability.py      # ~5 min
 python src/05_site_recommendation.py  # ~5 min
-
-# All maps saved to maps/  |  All rasters saved to data/processed/
 ```
+
+All maps are saved to `maps/` and all rasters to `data/processed/`.
 
 ---
 
@@ -104,7 +107,7 @@ python src/05_site_recommendation.py  # ~5 min
 |--------|-------|
 | Study area | 488 km² (79.02–79.22°E, 12.82–13.02°N) |
 | Resolution | 30 m (Landsat 8/9 OLI) |
-| LULC Kappa (best) | 0.76 (2024) |
+| Best LULC Kappa | 0.76 (2024) |
 | ANN validation AUC | 0.685 |
 | AHP Consistency Ratio | 0.0117 (< 0.10 ✅) |
 | High suitability area | 73.3 km² |
@@ -126,24 +129,6 @@ python src/05_site_recommendation.py  # ~5 min
 
 ---
 
-## Dependencies
-
-```
-Python 3.11+
-geopandas, rasterio, numpy, scipy
-scikit-learn, tensorflow, keras
-osmnx, matplotlib, pyproj, shapely
-rasterstats
-```
-
-Install:
-```bash
-pip install geopandas rasterio scikit-learn tensorflow osmnx \
-            rasterstats scipy matplotlib pyproj shapely --break-system-packages
-```
-
----
-
 ## Data Sources
 
 | Dataset | Source | Licence |
@@ -155,15 +140,27 @@ pip install geopandas rasterio scikit-learn tensorflow osmnx \
 
 ---
 
-## Citation
+## Dependencies
 
-If you use this work, please cite:
+```
+Python 3.11+
+geopandas, rasterio, numpy, scipy
+scikit-learn, tensorflow, keras
+osmnx, matplotlib, pyproj, shapely
+rasterstats
+```
+
+Install: `pip install -r requirements.txt`
+
+---
+
+## Citation
 
 ```
 D. K., "Hospital Site Suitability Prediction Using CA-ANN and AHP-Based
-Multi-Criteria Analysis for Vellore, Tamil Nadu," IEEE [Conference], 2025.
+Multi-Criteria Analysis for Vellore, Tamil Nadu," IEEE Conference, 2025.
 ```
 
 ---
 
-*Generated as part of an IEEE conference submission. All code open-source.*
+*All code is open-source. Maps and rasters are reproducible from publicly available data.*
