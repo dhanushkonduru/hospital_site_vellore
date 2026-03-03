@@ -63,6 +63,10 @@ matplotlib.use('Agg')
 import matplotlib.pyplot as plt
 import matplotlib.patches as mpatches
 from scipy.ndimage import generic_filter, uniform_filter, binary_erosion
+try:
+    from skimage.util import view_as_windows  # type: ignore
+except Exception:
+    from numpy.lib.stride_tricks import sliding_window_view as view_as_windows
 
 warnings.filterwarnings('ignore')
 
@@ -82,6 +86,7 @@ except ImportError:
 from sklearn.ensemble import RandomForestClassifier
 from sklearn.metrics import (cohen_kappa_score, classification_report,
                              confusion_matrix, accuracy_score)
+from sklearn.model_selection import GroupKFold
 
 # ══════════════════════════════════════════════════════════════════════════════
 # PROJECT PATHS
@@ -162,19 +167,19 @@ CONFIG = {
     # ── Random Forest hyperparameters ─────────────────────────────────────────
     # Tuned for Kappa ≥ 0.80 on South Asian Landsat LULC classification
     "rf": {
-        "n_estimators":     500,    # more trees = more stable, diminishing returns after 300
+        "n_estimators":     800,
         "max_features":    "sqrt",  # sqrt(n_features) per split — standard best practice
-        "max_depth":        25,     # deep enough to capture complex boundaries
-        "min_samples_leaf": 2,      # prevents overfitting on noisy pixels
+        "max_depth":        30,
+        "min_samples_leaf": 2,
         "min_samples_split":4,
-        "class_weight":   "balanced",  # critical for minority classes (water, bare)
+        "class_weight":   "balanced_subsample",
         "oob_score":        True,   # free accuracy estimate without a separate val set
         "n_jobs":          -1,      # use all CPU cores
         "random_state":    42,
     },
 
     # ── Sampling settings ─────────────────────────────────────────────────────
-    "min_samples_per_class": 800,
+    "min_samples_per_class": 600,
 
     # ── Spectral thresholds for pure-pixel auto-sampling ──────────────────────
     # Conservative values for post-monsoon South Asian Landsat (Oct–Dec)
@@ -189,14 +194,17 @@ CONFIG = {
     # ── Output options ────────────────────────────────────────────────────────
     "save_maps":    True,   # save PNG map per year to maps/
     "modal_filter": True,   # 3×3 mode filter to remove classification noise
+    "debug":        True,
 }
 
 # ── Class definitions ──────────────────────────────────────────────────────────
 CLASSES = {1: "Built-up/Impervious", 2: "Vegetation", 3: "Water", 4: "Bare/Fallow"}
 COLORS  = {1: "#E74C3C",             2: "#27AE60",    3: "#2980B9", 4: "#D4AC0D"}
 FEAT_NAMES = ["B2","B3","B4","B5","B6",
-              "NDVI","NDBI","MNDWI","BSI","EVI","SAVI","IBI",
-              "NDVI_fmean","NDVI_fstd","NDBI_fmean","NDBI_fstd"]
+              "NDVI","NDBI","MNDWI","BSI","EVI","SAVI","IBI","AWEI",
+              "NDVI_fmean","NDVI_fstd","NDBI_fmean","NDBI_fstd",
+              "GLCM_contrast","GLCM_homogeneity","GLCM_entropy",
+              "Slope"]
 
 
 # ══════════════════════════════════════════════════════════════════════════════
@@ -223,9 +231,19 @@ def compute_indices(B2, B3, B4, B5, B6):
     EVI   = 2.5 * (B5 - B4) / (B5 + 6*B4 - 7.5*B2 + 1 + e)
     SAVI  = 1.5 * (B5 - B4) / (B5 + B4 + 0.5 + e)
     IBI   = (2*NDBI - (SAVI + MNDWI)) / (2*NDBI + SAVI + MNDWI + e)
-    for arr in [NDVI, NDBI, MNDWI, BSI, EVI, SAVI, IBI]:
+    AWEI  = 4 * (B3 - B6) - (0.25 * B5 + 2.75 * B6)
+    for arr in [NDVI, NDBI, MNDWI, BSI, EVI, SAVI, IBI, AWEI]:
         np.clip(arr, -1, 1, out=arr)
-    return NDVI, NDBI, MNDWI, BSI, EVI, SAVI, IBI
+    return NDVI, NDBI, MNDWI, BSI, EVI, SAVI, IBI, AWEI
+
+
+def normalize_01(arr):
+    arr = arr.astype(np.float32)
+    mn = np.nanmin(arr)
+    mx = np.nanmax(arr)
+    if mx - mn < 1e-10:
+        return np.zeros_like(arr, dtype=np.float32)
+    return (arr - mn) / (mx - mn + 1e-10)
 
 
 def compute_texture(band, window=5):
@@ -240,19 +258,73 @@ def compute_texture(band, window=5):
     return fm.astype(np.float32), fsd.astype(np.float32)
 
 
-def build_feature_stack(B2, B3, B4, B5, B6):
+def compute_glcm_texture_fast(band, window=5, levels=16, chunk_size=50000):
     """
-    Returns (H, W, 16) float32 array:
-      5 raw bands + 7 spectral indices + 4 texture features
+    Vectorized GLCM texture over local windows using horizontal pairs
+    (distance=1, angle=0). No nested pixel loops.
+    Returns normalized contrast, homogeneity, entropy in [0,1].
     """
-    NDVI, NDBI, MNDWI, BSI, EVI, SAVI, IBI = compute_indices(B2, B3, B4, B5, B6)
+    band_n = normalize_01(np.nan_to_num(band, nan=0.0))
+    q = np.clip((band_n * (levels - 1)).round().astype(np.int16), 0, levels - 1)
+
+    pad = window // 2
+    q_pad = np.pad(q, pad, mode="reflect")
+    windows = view_as_windows(q_pad, (window, window))  # (H, W, w, w)
+
+    left = windows[:, :, :, :-1]
+    right = windows[:, :, :, 1:]
+    pair_ids = (left * levels + right).reshape(-1, window * (window - 1))
+
+    pair_count = pair_ids.shape[1]
+    i = np.arange(levels, dtype=np.float32)[:, None]
+    j = np.arange(levels, dtype=np.float32)[None, :]
+    contrast_lut = ((i - j) ** 2).ravel()
+    homogeneity_lut = (1.0 / (1.0 + np.abs(i - j))).ravel()
+
+    contrast = contrast_lut[pair_ids].mean(axis=1)
+    homogeneity = homogeneity_lut[pair_ids].mean(axis=1)
+
+    entropy = np.zeros(pair_ids.shape[0], dtype=np.float32)
+    n_bins = levels * levels
+    for s in range(0, pair_ids.shape[0], chunk_size):
+        e = min(s + chunk_size, pair_ids.shape[0])
+        obs = pair_ids[s:e]
+        m = obs.shape[0]
+        counts = np.zeros((m, n_bins), dtype=np.float32)
+        r = np.repeat(np.arange(m), pair_count)
+        np.add.at(counts, (r, obs.reshape(-1)), 1)
+        p = counts / float(pair_count)
+        entropy[s:e] = -np.sum(np.where(p > 0, p * np.log2(p + 1e-12), 0.0), axis=1)
+
+    H, W = band.shape
+    contrast = normalize_01(contrast.reshape(H, W))
+    homogeneity = normalize_01(homogeneity.reshape(H, W))
+    entropy = normalize_01(entropy.reshape(H, W))
+    return contrast, homogeneity, entropy
+
+
+def build_feature_stack(B2, B3, B4, B5, B6, slope_feature=None):
+    """
+    Returns (H, W, 21) float32 array:
+      B2-B6 + NDVI/NDBI/MNDWI/BSI/EVI/SAVI/IBI/AWEI +
+      NDVI/NDBI mean-std texture + GLCM(contrast/homogeneity/entropy) + slope
+    """
+    NDVI, NDBI, MNDWI, BSI, EVI, SAVI, IBI, AWEI = compute_indices(B2, B3, B4, B5, B6)
     ndvi_fm, ndvi_fs = compute_texture(NDVI)
     ndbi_fm, ndbi_fs = compute_texture(NDBI)
+    glcm_contrast, glcm_homogeneity, glcm_entropy = compute_glcm_texture_fast(B6, window=5, levels=16)
+
+    if slope_feature is None:
+        slope_feature = np.zeros_like(B2, dtype=np.float32)
+
+    AWEI_n = normalize_01(AWEI)
 
     stack = np.stack([
         B2, B3, B4, B5, B6,
-        NDVI, NDBI, MNDWI, BSI, EVI, SAVI, IBI,
+        NDVI, NDBI, MNDWI, BSI, EVI, SAVI, IBI, AWEI_n,
         ndvi_fm, ndvi_fs, ndbi_fm, ndbi_fs,
+        glcm_contrast, glcm_homogeneity, glcm_entropy,
+        slope_feature,
     ], axis=-1).astype(np.float32)
     return np.nan_to_num(stack, nan=0.0, posinf=1.0, neginf=-1.0)
 
@@ -261,7 +333,7 @@ def build_feature_stack(B2, B3, B4, B5, B6):
 # TRAINING SAMPLE EXTRACTION  — Fix 3
 # ══════════════════════════════════════════════════════════════════════════════
 
-def auto_sample(NDVI, NDBI, MNDWI, BSI, n=800, seed=42):
+def auto_sample(NDVI, NDBI, MNDWI, BSI, n=600, seed=42):
     """
     Extract spectrally pure pixels per class using conservative thresholds.
     Samples are stratified across 4 spatial quadrants to prevent spatial
@@ -270,105 +342,101 @@ def auto_sample(NDVI, NDBI, MNDWI, BSI, n=800, seed=42):
     rng = np.random.default_rng(seed)
     H, W = NDVI.shape
     idx  = np.arange(H * W)
-    t    = CONFIG["thresholds"]
 
     NDVI_smooth  = uniform_filter(NDVI, size=3)
     NDBI_smooth  = uniform_filter(NDBI, size=3)
     MNDWI_smooth = uniform_filter(MNDWI, size=3)
-    BSI_smooth   = uniform_filter(BSI, size=3)
 
-    min_required = max(150, n // 4)
+    p_ndvi_25 = np.percentile(NDVI_smooth, 25)
+    p_ndvi_50 = np.percentile(NDVI_smooth, 50)
+    p_ndvi_75 = np.percentile(NDVI_smooth, 75)
+    p_ndbi_50 = np.percentile(NDBI_smooth, 50)
+    p_ndbi_75 = np.percentile(NDBI_smooth, 75)
+    p_mndwi_80 = np.percentile(MNDWI_smooth, 80)
 
-    def get_class_mask(cls, thr):
-        if cls == 1:
-            return ((NDBI_smooth > thr["NDBI"]) &
-                    (NDVI_smooth < thr["NDVI_max"]) &
-                    (MNDWI_smooth < thr.get("MNDWI_max", -0.05)))
-        if cls == 2:
-            return ((NDVI_smooth > thr["NDVI"]) &
-                    (NDBI_smooth < thr.get("NDBI_max", -0.05)))
-        if cls == 3:
-            return ((MNDWI_smooth > thr["MNDWI"]) &
-                    (NDVI_smooth < thr.get("NDVI_max", 0.10)))
-        return ((BSI_smooth > thr["BSI"]) &
-                (NDVI_smooth < thr["NDVI_max"]) &
-                (MNDWI_smooth < thr["MNDWI_max"]) &
-                (NDBI_smooth < thr.get("NDBI_max", -0.02)))
+    veg_mask = NDVI_smooth > p_ndvi_75
+    built_mask = (NDBI_smooth > p_ndbi_75) & (NDVI_smooth < p_ndvi_50)
+    water_mask = MNDWI_smooth > p_mndwi_80
+    bare_mask = (NDVI_smooth < p_ndvi_25) & (NDBI_smooth < p_ndbi_50) & (~water_mask)
 
-    relaxed_profiles = {
-        1: [
-            {"NDBI": t["built_up"]["NDBI"], "NDVI_max": t["built_up"]["NDVI_max"], "MNDWI_max": -0.05},
-            {"NDBI": 0.10, "NDVI_max": 0.12, "MNDWI_max": -0.03},
-            {"NDBI": 0.08, "NDVI_max": 0.15, "MNDWI_max": -0.01},
-        ],
-        2: [
-            {"NDVI": t["vegetation"]["NDVI"], "NDBI_max": -0.05},
-            {"NDVI": 0.40, "NDBI_max": -0.03},
-            {"NDVI": 0.35, "NDBI_max": -0.02},
-        ],
-        3: [
-            {"MNDWI": t["water"]["MNDWI"], "NDVI_max": 0.10},
-            {"MNDWI": 0.20, "NDVI_max": 0.12},
-            {"MNDWI": 0.15, "NDVI_max": 0.15},
-        ],
-        4: [
-            {"BSI": t["bare"]["BSI"], "NDVI_max": t["bare"]["NDVI_max"], "MNDWI_max": t["bare"]["MNDWI_max"], "NDBI_max": -0.02},
-            {"BSI": 0.06, "NDVI_max": 0.18, "MNDWI_max": 0.03, "NDBI_max": 0.00},
-            {"BSI": 0.05, "NDVI_max": 0.20, "MNDWI_max": 0.05, "NDBI_max": 0.02},
-        ],
+    masks_2d = {
+        1: binary_erosion(built_mask, iterations=1),
+        2: binary_erosion(veg_mask, iterations=1),
+        3: binary_erosion(water_mask, iterations=1),
+        4: binary_erosion(bare_mask, iterations=1),
     }
 
-    masks = {}
-    for cls in [1, 2, 3, 4]:
-        best_mask = np.zeros((H, W), dtype=bool)
-        for profile in relaxed_profiles[cls]:
-            raw_mask = get_class_mask(cls, profile)
-            eroded = binary_erosion(raw_mask, iterations=2)
-            selected = eroded if eroded.sum() >= min_required else raw_mask
-            best_mask = selected
-            if selected.sum() >= min_required:
-                break
-        masks[cls] = best_mask.ravel()
+    def _ensure_non_empty(cls):
+        m = masks_2d[cls]
+        if m.sum() > 0:
+            return m
+        if cls == 1:
+            return (NDBI_smooth > np.percentile(NDBI_smooth, 65)) & (NDVI_smooth < np.percentile(NDVI_smooth, 60))
+        if cls == 2:
+            return NDVI_smooth > np.percentile(NDVI_smooth, 65)
+        if cls == 3:
+            return MNDWI_smooth > np.percentile(MNDWI_smooth, 70)
+        return (NDVI_smooth < np.percentile(NDVI_smooth, 35)) & (NDBI_smooth < np.percentile(NDBI_smooth, 65))
+
+    masks_2d = {cls: _ensure_non_empty(cls) for cls in [1, 2, 3, 4]}
+
+    def _stratified_pick(cands, n_target):
+        if len(cands) == 0:
+            cands = idx
+        rows = cands // W
+        cols = cands % W
+        n_side = 4
+        block_id = (rows * n_side // H) * n_side + (cols * n_side // W)
+        chosen = []
+        per_block = max(1, n_target // (n_side * n_side))
+        for block in range(n_side * n_side):
+            block_px = cands[block_id == block]
+            if len(block_px) == 0:
+                continue
+            take = min(per_block, len(block_px))
+            chosen.append(rng.choice(block_px, take, replace=False))
+        chosen = np.concatenate(chosen) if chosen else np.array([], dtype=int)
+        if len(chosen) < n_target:
+            replace = len(cands) < (n_target - len(chosen))
+            extra = rng.choice(cands, n_target - len(chosen), replace=replace)
+            chosen = np.concatenate([chosen, extra])
+        return chosen[:n_target]
 
     samples = {}
-    for cls, mask in masks.items():
-        cands = idx[mask]
-        if len(cands) == 0:
-            print(f"  ⚠  No pixels for class {cls} ({CLASSES[cls]}) — "
-                  "loosen CONFIG thresholds or add manual samples")
-            samples[cls] = np.array([], dtype=int)
-            continue
-
-        if len(cands) < n:
-            print(f"  ⚠  Class {cls}: only {len(cands)} px (target {n}) — using all")
-            samples[cls] = cands
-            continue
-
-        # Quadrant stratification: sample evenly from NW / NE / SW / SE
-        rows = cands // W;  cols = cands % W
-        hm = H // 2;        wm = W // 2
-        quads = [
-            cands[(rows <  hm) & (cols <  wm)],
-            cands[(rows <  hm) & (cols >= wm)],
-            cands[(rows >= hm) & (cols <  wm)],
-            cands[(rows >= hm) & (cols >= wm)],
-        ]
-        chosen = []
-        pq = n // 4
-        for q in quads:
-            if len(q):
-                chosen.append(rng.choice(q, min(pq, len(q)), replace=False))
-        chosen = np.concatenate(chosen) if chosen else np.array([], dtype=int)
-        if len(chosen) < n:
-            rem = np.setdiff1d(cands, chosen)
-            if len(rem):
-                chosen = np.concatenate([
-                    chosen, rng.choice(rem, min(n-len(chosen), len(rem)), replace=False)
-                ])
-        samples[cls] = chosen[:n]
-        print(f"  Class {cls} ({CLASSES[cls]:<22}): {len(samples[cls]):>4} samples")
+    for cls in [1, 2, 3, 4]:
+        cands = idx[masks_2d[cls].ravel()]
+        samples[cls] = _stratified_pick(cands, n)
+        print(f"  Class {cls} ({CLASSES[cls]:<22}): {len(samples[cls]):>4} samples"
+              f" (candidates={len(cands):,})")
 
     return samples
+
+
+def print_feature_sanity(stack):
+    print("\n  Feature sanity check:")
+    for i in range(stack.shape[-1]):
+        arr = stack[:, :, i]
+        name = FEAT_NAMES[i] if i < len(FEAT_NAMES) else f"f{i}"
+        print(f"    {name:>12} | min={np.nanmin(arr): .4f} max={np.nanmax(arr): .4f} "
+              f"nan={np.isnan(arr).sum()}")
+
+
+def spatial_block_cv(X, y, px_abs, H, W, n_splits=4):
+    rows = px_abs // W
+    cols = px_abs % W
+    n_side = 4
+    groups = (rows * n_side // H) * n_side + (cols * n_side // W)
+    gkf = GroupKFold(n_splits=n_splits)
+    kappas = []
+    for fold, (tr, te) in enumerate(gkf.split(X, y, groups=groups), start=1):
+        model = RandomForestClassifier(**CONFIG["rf"])
+        model.fit(X[tr], y[tr])
+        pred = model.predict(X[te])
+        kap = cohen_kappa_score(y[te], pred)
+        kappas.append(kap)
+        if CONFIG.get("debug", False):
+            print(f"  CV fold {fold}: Kappa={kap:.4f}")
+    print(f"  Spatial 4-fold CV Kappa: mean={np.mean(kappas):.4f} std={np.std(kappas):.4f}")
 
 
 # ══════════════════════════════════════════════════════════════════════════════
@@ -534,33 +602,101 @@ def load_bands(cfg):
     The clip step is essential: without it, 02 classifies the full
     Tamil Nadu Landsat tile (7800×7600 px) instead of Vellore (744×730 px).
     """
-    bands   = []
-    profile = None
-    for bp in cfg["bands"]:
-        with rasterio.open(bp) as src:
-            raw_clipped, prof = clip_band_to_study_area(src)
-            if profile is None:
-                profile = prof
-            raw = raw_clipped.astype(np.float32)
-            bands.append(np.clip(raw * 0.0000275 - 0.2, 0.0, 1.0))
+    scenes_cfg = cfg.get("scenes")
+    if not scenes_cfg:
+        scenes_cfg = [{"bands": cfg["bands"], "qa_band": cfg.get("qa_band")}]
 
-    B2, B3, B4, B5, B6 = bands[:5]
+    scene_bands = []
+    cloud_before = []
+    profile = None
+
+    for scene in scenes_cfg:
+        bands_scene = []
+        for bp in scene["bands"]:
+            with rasterio.open(bp) as src:
+                raw_clipped, prof = clip_band_to_study_area(src)
+                if profile is None:
+                    profile = prof
+                raw = raw_clipped.astype(np.float32)
+                bands_scene.append(raw * 0.0000275 - 0.2)
+
+        qa = scene.get("qa_band")
+        if qa and os.path.exists(qa):
+            with rasterio.open(qa) as src:
+                qab_clipped, _ = clip_band_to_study_area(src)
+            bad = ((qab_clipped & (1<<1)) | (qab_clipped & (1<<3)) | (qab_clipped & (1<<4))) > 0
+            cloud_before.append(float(bad.mean() * 100.0))
+            for bi in range(len(bands_scene)):
+                b = bands_scene[bi]
+                b = b.astype(np.float32)
+                b[bad] = np.nan
+                bands_scene[bi] = b
+        else:
+            cloud_before.append(0.0)
+
+        scene_bands.append(bands_scene)
+
+    n_scenes = len(scene_bands)
+    B2 = np.nanmedian(np.stack([scene_bands[i][0] for i in range(n_scenes)], axis=0), axis=0)
+    B3 = np.nanmedian(np.stack([scene_bands[i][1] for i in range(n_scenes)], axis=0), axis=0)
+    B4 = np.nanmedian(np.stack([scene_bands[i][2] for i in range(n_scenes)], axis=0), axis=0)
+    B5 = np.nanmedian(np.stack([scene_bands[i][3] for i in range(n_scenes)], axis=0), axis=0)
+    B6 = np.nanmedian(np.stack([scene_bands[i][4] for i in range(n_scenes)], axis=0), axis=0)
+
+    def _fill_nan(arr):
+        if np.isnan(arr).any():
+            med = np.nanmedian(arr)
+            if np.isnan(med):
+                med = 0.0
+            arr = np.where(np.isnan(arr), med, arr)
+        return arr.astype(np.float32)
+
+    B2, B3, B4, B5, B6 = map(_fill_nan, [B2, B3, B4, B5, B6])
+
     H, W = B2.shape
     print(f"  Clipped size: {H} × {W} = {H*W:,} pixels "
           f"(study area: {H*W*0.0009:.1f} km²)")
+    print(f"  Cloud before composite: {np.mean(cloud_before):.1f}% ({n_scenes} scene(s))")
 
-    qa = cfg.get("qa_band")
-    if qa and os.path.exists(qa):
-        with rasterio.open(qa) as src:
-            qab_clipped, _ = clip_band_to_study_area(src)
-        bad = ((qab_clipped & (1<<1)) | (qab_clipped & (1<<3)) | (qab_clipped & (1<<4))) > 0
-        for b in [B2, B3, B4, B5, B6]:
-            b[bad] = 0.0
-        print(f"  Cloud mask  : {bad.sum():,} px ({bad.mean()*100:.1f}%)")
-    else:
-        print("  Cloud mask  : skipped (set qa_band in CONFIG)")
+    nan_after = np.mean(np.isnan(np.stack([B2, B3, B4, B5, B6], axis=0))) * 100.0
+    print(f"  Cloud after composite : {nan_after:.1f}%")
 
     return B2, B3, B4, B5, B6, profile
+
+
+def load_slope_feature(profile):
+    from rasterio.warp import reproject, Resampling
+    dem_candidates = [
+        os.path.join(ROOT, "data", "raw", "srtm_vellore.tif"),
+        os.path.join(ROOT, "data", "raw", "srtm", "vellore_srtm.tif"),
+        os.path.join(ROOT, "data", "raw", "dem", "vellore_dem.tif"),
+    ]
+    dem_path = None
+    for p in dem_candidates:
+        if os.path.exists(p):
+            dem_path = p
+            break
+    if dem_path is None:
+        print("  ⚠  DEM not found — slope feature set to zeros")
+        return np.zeros((profile["height"], profile["width"]), dtype=np.float32)
+
+    dem = np.zeros((profile["height"], profile["width"]), dtype=np.float32)
+    with rasterio.open(dem_path) as src:
+        reproject(
+            source=rasterio.band(src, 1),
+            destination=dem,
+            src_transform=src.transform,
+            src_crs=src.crs,
+            dst_transform=profile["transform"],
+            dst_crs=profile["crs"],
+            resampling=Resampling.bilinear,
+        )
+    from scipy.ndimage import sobel
+    gx = sobel(dem, axis=1)
+    gy = sobel(dem, axis=0)
+    slope = np.sqrt(gx**2 + gy**2).astype(np.float32)
+    slope = normalize_01(np.nan_to_num(slope, nan=0.0))
+    return slope
 
 
 def process_year(year, cfg):
@@ -570,10 +706,19 @@ def process_year(year, cfg):
     H, W = B2.shape
     print(f"  Scene size  : {H} × {W} = {H*W:,} pixels")
 
-    print("\n  Building 16-feature stack...")
-    stack = build_feature_stack(B2, B3, B4, B5, B6)
+    print("\n  Building feature stack (bands + indices + GLCM + slope)...")
+    slope = load_slope_feature(profile)
+    stack = build_feature_stack(B2, B3, B4, B5, B6, slope_feature=slope)
 
     NDVI, NDBI, MNDWI, BSI, *_ = compute_indices(B2, B3, B4, B5, B6)
+    if CONFIG.get("debug", False):
+        print(f"  NDVI range  : {np.nanmin(NDVI):.4f} to {np.nanmax(NDVI):.4f}")
+        print(f"  NDBI range  : {np.nanmin(NDBI):.4f} to {np.nanmax(NDBI):.4f}")
+        print(f"  MNDWI range : {np.nanmin(MNDWI):.4f} to {np.nanmax(MNDWI):.4f}")
+        print(f"  Slope range : {np.nanmin(slope):.4f} to {np.nanmax(slope):.4f}")
+        print(f"  Feature stack shape: {stack.shape}")
+        print(f"  Final feature count: {stack.shape[-1]}")
+        print_feature_sanity(stack)
 
     print(f"\n  Auto-sampling {CONFIG['min_samples_per_class']} px/class...")
     samp = auto_sample(NDVI, NDBI, MNDWI, BSI, n=CONFIG["min_samples_per_class"])
@@ -588,19 +733,44 @@ def process_year(year, cfg):
     X_all = np.vstack(Xl);  y_all = np.concatenate(yl)
     px_all = np.concatenate(pxl)
 
+    print("  Sample counts before training:")
+    for cls in sorted(CLASSES):
+        print(f"    {CLASSES[cls]:<22}: {(y_all == cls).sum():,}")
+
+    spatial_block_cv(X_all, y_all, px_all, H, W, n_splits=4)
+
     print("\n  Spatial block holdout (16 blocks, 6 withheld)...")
     tr_loc, te_loc = spatial_block_holdout(np.arange(len(px_all)), H, W)
     X_tr, y_tr = X_all[tr_loc], y_all[tr_loc]
     X_te, y_te = X_all[te_loc], y_all[te_loc]
     print(f"  Train: {len(X_tr):,}   Test: {len(X_te):,}")
 
-    print("\n  Training Random Forest (500 trees, balanced)...")
+    print("\n  Training Random Forest (800 trees, balanced_subsample)...")
     t0 = time.time()
     rf = train_rf(X_tr, y_tr)
     print(f"  Train time  : {time.time()-t0:.1f}s")
 
+    legacy_idx = [0,1,2,3,4,5,6,7,8,9,10,11,13,14,15,16]
+    rf_before = RandomForestClassifier(**CONFIG["rf"])
+    rf_before.fit(X_tr[:, legacy_idx], y_tr)
+    pred_before = rf_before.predict(X_te[:, legacy_idx])
+    cm_before = confusion_matrix(y_te, pred_before, labels=sorted(CLASSES))
+    print("\n  Confusion matrix BEFORE upgrade (legacy features):")
+    print(cm_before)
+
     kappa, oa = evaluate(y_te, rf.predict(X_te), year, "spatial holdout")
+    cm_after = confusion_matrix(y_te, rf.predict(X_te), labels=sorted(CLASSES))
+    print("\n  Confusion matrix AFTER upgrade:")
+    print(cm_after)
     print_top_features(rf)
+
+    if CONFIG.get("debug", False):
+        print("  RF feature importances:")
+        for i, imp in enumerate(rf.feature_importances_):
+            name = FEAT_NAMES[i] if i < len(FEAT_NAMES) else f"f{i}"
+            print(f"    {name:>12}: {imp:.6f}")
+        slope_idx = FEAT_NAMES.index("Slope")
+        print(f"  Slope importance: {rf.feature_importances_[slope_idx]:.6f}")
 
     print(f"\n  Classifying full scene ({H*W:,} px)...")
     pred_map = rf.predict(flat).reshape(H, W).astype(np.uint8)
@@ -658,17 +828,17 @@ def run_demo():
     rng = np.random.default_rng(42)
     # Spectral feature means per class — calibrated to Vellore Oct–Dec Landsat
     means = {
-        1: [ 0.15, 0.15, 0.14, 0.18, 0.30,-0.10, 0.25,-0.30, 0.18, 0.05, 0.05, 0.22, 0.00, 0.05, 0.00, 0.05],
-        2: [ 0.04, 0.07, 0.05, 0.35, 0.15, 0.75,-0.40, 0.10,-0.20, 0.55, 0.55,-0.40, 0.00, 0.03, 0.00, 0.02],
-        3: [ 0.04, 0.06, 0.04, 0.05, 0.03, 0.05,-0.30, 0.55,-0.15, 0.02, 0.03,-0.35, 0.00, 0.01, 0.00, 0.01],
-        4: [ 0.18, 0.20, 0.22, 0.28, 0.32, 0.10, 0.10,-0.20, 0.15, 0.08, 0.08, 0.08, 0.00, 0.08, 0.00, 0.06],
+        1: [ 0.15, 0.15, 0.14, 0.18, 0.30,-0.10, 0.25,-0.30, 0.18, 0.05, 0.05, 0.22, 0.35, 0.00, 0.05, 0.00, 0.05, 0.45, 0.55, 0.40, 0.15],
+        2: [ 0.04, 0.07, 0.05, 0.35, 0.15, 0.75,-0.40, 0.10,-0.20, 0.55, 0.55,-0.40,-0.05, 0.00, 0.03, 0.00, 0.02, 0.12, 0.80, 0.18, 0.35],
+        3: [ 0.04, 0.06, 0.04, 0.05, 0.03, 0.05,-0.30, 0.55,-0.15, 0.02, 0.03,-0.35, 0.65, 0.00, 0.01, 0.00, 0.01, 0.08, 0.88, 0.10, 0.05],
+        4: [ 0.18, 0.20, 0.22, 0.28, 0.32, 0.10, 0.10,-0.20, 0.15, 0.08, 0.08, 0.08,-0.15, 0.00, 0.08, 0.00, 0.06, 0.58, 0.38, 0.52, 0.55],
     }
     results = {}
     for year in [2013, 2019, 2024]:
         print(f"\n{'─'*60}  YEAR {year}")
         X, y = [], []
         for cls, m in means.items():
-            X.append(rng.normal(m, 0.06, (600, 16)).astype(np.float32))
+            X.append(rng.normal(m, 0.06, (600, len(FEAT_NAMES))).astype(np.float32))
             y.append(np.full(600, cls, dtype=int))
         X = np.vstack(X);  y = np.concatenate(y)
         shuf = rng.permutation(len(y));  X, y = X[shuf], y[shuf]
@@ -676,7 +846,7 @@ def run_demo():
         t0   = time.time()
         rf   = train_rf(X[:sp], y[:sp])
         print(f"  Train time  : {time.time()-t0:.1f}s")
-        kappa, oa = evaluate(rf.predict(X[sp:]), y[sp:], year, "demo")
+        kappa, oa = evaluate(y[sp:], rf.predict(X[sp:]), year, "demo")
         print_top_features(rf)
         results[year] = {"kappa": kappa, "oa": oa}
 

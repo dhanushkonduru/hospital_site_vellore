@@ -37,7 +37,7 @@ from sklearn.preprocessing import MinMaxScaler
 from sklearn.model_selection import train_test_split
 from sklearn.isotonic import IsotonicRegression
 from sklearn.metrics import (classification_report, cohen_kappa_score,
-                              confusion_matrix)
+                              confusion_matrix, precision_recall_curve)
 import matplotlib.pyplot as plt
 import matplotlib.colors as mcolors
 import matplotlib.patches as mpatches
@@ -55,6 +55,7 @@ OUT_DIR.mkdir(parents=True, exist_ok=True)
 # ── Constants ─────────────────────────────────────────────────────────────────
 BUILT_UP_CLASS = 1
 VELLORE_CBD    = (79.1324, 12.9165)   # lon, lat — Vellore city center
+DEBUG = True
 
 # ── Vellore study area clip bounds (WGS84) ────────────────────────────────────
 # FIX: Stage 2 now writes full-scene TIFs (7801×7631).
@@ -317,12 +318,37 @@ def train_ann(X_train, y_train, X_val, y_val):
     print(f"   Val AUC:    {history.history['val_auc'][best_epoch]:.4f}")
     print(f"   Val Loss:   {history.history['val_loss'][best_epoch]:.4f}")
 
-    val_prob = model.predict(X_val_s, batch_size=1024, verbose=0).ravel()
+    raw_val_prob = model.predict(X_val_s, batch_size=1024, verbose=0).ravel()
     calibrator = IsotonicRegression(out_of_bounds="clip")
-    calibrator.fit(val_prob, y_val)
+    calibrator.fit(raw_val_prob, y_val)
+    calibrated_val_probs = calibrator.transform(raw_val_prob)
+
+    precision, recall, thresholds = precision_recall_curve(y_val, calibrated_val_probs)
+    if len(thresholds) > 0:
+        f1_scores = 2 * precision[:-1] * recall[:-1] / (precision[:-1] + recall[:-1] + 1e-10)
+        best_idx = int(np.nanargmax(f1_scores))
+        best_threshold = float(thresholds[best_idx])
+    else:
+        best_threshold = 0.5
+
+    pred_val = (calibrated_val_probs >= best_threshold).astype(np.uint8)
+    if pred_val.sum() == 0 and np.sum(y_val == 1) > 0:
+        best_threshold = float(np.percentile(calibrated_val_probs[y_val == 1], 10))
+        pred_val = (calibrated_val_probs >= best_threshold).astype(np.uint8)
+
+    val_cm = confusion_matrix(y_val, pred_val, labels=[0, 1])
+    print(f"   Best threshold (F1): {best_threshold:.4f}")
+    print("   Validation confusion matrix [[TN,FP],[FN,TP]]:")
+    print(f"   {val_cm.tolist()}")
+    print(f"   Predicted positive count: {int(pred_val.sum())}")
+    print(f"   True positive count:      {int(np.sum((pred_val == 1) & (y_val == 1)))}")
     print("   ✅ Isotonic calibration fitted on validation probabilities")
 
-    return model, scaler, history, calibrator
+    if DEBUG:
+        print(f"   Debug: raw_val_prob range = {raw_val_prob.min():.4f}..{raw_val_prob.max():.4f}")
+        print(f"   Debug: calibrated range   = {calibrated_val_probs.min():.4f}..{calibrated_val_probs.max():.4f}")
+
+    return model, scaler, history, calibrator, best_threshold
 
 
 # ════════════════════════════════════════════════════════════════════════════
@@ -349,7 +375,7 @@ def compute_transition_prob(model, scaler, calibrator, drivers, lulc_current):
 # ════════════════════════════════════════════════════════════════════════════
 # STEP 6 — Cellular Automata simulation
 # ════════════════════════════════════════════════════════════════════════════
-def run_ca_simulation(lulc_current, model, scaler, calibrator, drivers,
+def run_ca_simulation(lulc_current, model, scaler, calibrator, prob_threshold, drivers,
                       n_steps, growth_rate_per_step):
     lulc_sim = lulc_current.copy()
     H, W = lulc_sim.shape
@@ -373,8 +399,13 @@ def run_ca_simulation(lulc_current, model, scaler, calibrator, drivers,
 
         non_built_idx = np.where((lulc_sim != BUILT_UP_CLASS).ravel())[0]
         prob_flat     = prob.ravel()
-        top_idx       = non_built_idx[
-            np.argsort(prob_flat[non_built_idx])[-n_convert:]]
+        eligible_idx = non_built_idx[prob_flat[non_built_idx] >= prob_threshold]
+        if len(eligible_idx) >= n_convert:
+            source_idx = eligible_idx
+        else:
+            source_idx = non_built_idx
+
+        top_idx = source_idx[np.argsort(prob_flat[source_idx])[-n_convert:]]
 
         lulc_flat = lulc_sim.ravel()
         lulc_flat[top_idx] = BUILT_UP_CLASS
@@ -384,6 +415,9 @@ def run_ca_simulation(lulc_current, model, scaler, calibrator, drivers,
         if (step + 1) % 3 == 0 or step == n_steps - 1:
             print(f"   Step {step+1:2d}: built-up={n_built:,} px "
                   f"({n_built/(H*W)*100:.1f}%)  converted={n_convert}")
+            if DEBUG:
+                pred_pos = int(np.sum(prob_flat >= prob_threshold))
+                print(f"      Debug: prob>=threshold pixels = {pred_pos:,} (threshold={prob_threshold:.4f})")
 
     return lulc_sim, prob
 
@@ -510,7 +544,7 @@ def main():
     X_tr, X_val, y_tr, y_val = train_test_split(
         X, y, test_size=0.2, stratify=y, random_state=42)
 
-    model, scaler, history, calibrator = train_ann(X_tr, y_tr, X_val, y_val)
+    model, scaler, history, calibrator, best_threshold = train_ann(X_tr, y_tr, X_val, y_val)
     plot_training_history(history)
 
     # Validate: simulate 2019→2024
@@ -523,7 +557,7 @@ def main():
     print(f"   Estimated annual growth rate: {annual_growth:.4f}")
 
     lulc_pred_2024, prob_2024 = run_ca_simulation(
-        lulc_2019, model, scaler, calibrator, drivers,
+        lulc_2019, model, scaler, calibrator, best_threshold, drivers,
         n_steps=6, growth_rate_per_step=annual_growth)
 
     kappa_val = validate(lulc_pred_2024, lulc_2024,
@@ -532,12 +566,12 @@ def main():
     # Predict 2030 and 2035
     print("\n🔮 Predicting 2030 (6 steps from 2024)...")
     lulc_2030, prob_2030 = run_ca_simulation(
-        lulc_2024, model, scaler, calibrator, drivers,
+        lulc_2024, model, scaler, calibrator, best_threshold, drivers,
         n_steps=6, growth_rate_per_step=annual_growth)
 
     print("\n🔮 Predicting 2035 (5 steps from 2030)...")
     lulc_2035, prob_2035 = run_ca_simulation(
-        lulc_2030, model, scaler, calibrator, drivers,
+        lulc_2030, model, scaler, calibrator, best_threshold, drivers,
         n_steps=5, growth_rate_per_step=annual_growth)
 
     # Growth hotspot map
