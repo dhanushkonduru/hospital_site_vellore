@@ -4,11 +4,6 @@
 Stage 2: Cellular Automata + Artificial Neural Network (CA-ANN)
 Urban Growth Prediction for Vellore Hospital Site Suitability Project.
 
-FIXES vs original:
-  - LULC_DIR corrected: data/processed/lulc_production → data/processed/lulc
-  - load_lulc() now clips full-scene TIFs to Vellore study area (744×730 px)
-    before any processing — fixes "built-up going backwards" issue
-  - Built-up pixel counts now match paper values (2013≈28%, 2024≈38%)
 
 Pipeline:
 1. Compute spatial driver rasters from existing data
@@ -22,10 +17,9 @@ Pipeline:
 import numpy as np
 import rasterio
 from rasterio.transform import rowcol
-from rasterio.mask import mask
+from rasterio.mask import mask as rio_mask
 from rasterio.enums import Resampling
 from rasterio.warp import reproject, calculate_default_transform
-from rasterio.mask import mask as rio_mask
 from rasterio.crs import CRS
 from rasterio.warp import transform_bounds
 from shapely.geometry import box
@@ -41,6 +35,8 @@ from sklearn.metrics import (classification_report, cohen_kappa_score,
 import matplotlib.pyplot as plt
 import matplotlib.colors as mcolors
 import matplotlib.patches as mpatches
+from matplotlib.lines import Line2D
+from matplotlib_scalebar.scalebar import ScaleBar
 from pathlib import Path
 import glob, warnings, os
 warnings.filterwarnings("ignore")
@@ -55,7 +51,6 @@ OUT_DIR.mkdir(parents=True, exist_ok=True)
 # ── Constants ─────────────────────────────────────────────────────────────────
 BUILT_UP_CLASS = 1
 VELLORE_CBD    = (79.1324, 12.9165)   # lon, lat — Vellore city center
-DEBUG = True
 
 # ── Vellore study area clip bounds (WGS84) ────────────────────────────────────
 # FIX: Stage 2 now writes full-scene TIFs (7801×7631).
@@ -113,8 +108,11 @@ def load_lulc(year):
         data, profile = clip_to_study_area(src)
         transform = profile["transform"]
         crs       = profile.get("crs", src.crs)
-    print(f"   ✅ LULC {year}: {data.shape}  CRS={crs}  "
-          f"built-up={np.sum(data==BUILT_UP_CLASS)/data.size*100:.1f}%")
+    valid = data > 0
+    n_valid = int(valid.sum())
+    built_pct = np.sum(data == BUILT_UP_CLASS) / max(1, n_valid) * 100
+    print(f"   \u2705 LULC {year}: {data.shape}  CRS={crs}  "
+          f"built-up={built_pct:.1f}% of valid ({n_valid/data.size*100:.1f}% clear)")
     return data, profile, transform, crs
 
 
@@ -253,7 +251,10 @@ def extract_transitions(lulc_t0, lulc_t1, drivers, n_samples=6000):
                        (lulc_t1 == BUILT_UP_CLASS)).ravel()
     stable_nonbuilt = ((lulc_t0 != BUILT_UP_CLASS) &
                        (lulc_t1 != BUILT_UP_CLASS)).ravel()
-    valid = ~np.isnan(feats).any(axis=1)
+    # Exclude nodata/cloud-masked pixels (class 0) from both timepoints
+    valid = (~np.isnan(feats).any(axis=1)
+             & (lulc_t0.ravel() > 0)
+             & (lulc_t1.ravel() > 0))
 
     pos_idx = np.where(transitioned & valid)[0]
     neg_idx = np.where(stable_nonbuilt & valid)[0]
@@ -282,15 +283,15 @@ def train_ann(X_train, y_train, X_val, y_val):
     X_val_s   = scaler.transform(X_val)
 
     model = keras.Sequential([
-        keras.layers.Dense(64, activation="relu", input_shape=(n_features,),
+        keras.layers.Dense(128, activation="relu", input_shape=(n_features,),
                            kernel_regularizer=keras.regularizers.l2(0.001)),
         keras.layers.BatchNormalization(),
         keras.layers.Dropout(0.3),
-        keras.layers.Dense(32, activation="relu",
+        keras.layers.Dense(64, activation="relu",
                            kernel_regularizer=keras.regularizers.l2(0.001)),
         keras.layers.BatchNormalization(),
         keras.layers.Dropout(0.2),
-        keras.layers.Dense(16, activation="relu"),
+        keras.layers.Dense(32, activation="relu"),
         keras.layers.Dense(1, activation="sigmoid")
     ])
     model.compile(
@@ -300,7 +301,7 @@ def train_ann(X_train, y_train, X_val, y_val):
     )
     callbacks = [
         keras.callbacks.EarlyStopping(
-            monitor="val_auc", patience=15,
+            monitor="val_auc", patience=20,
             restore_best_weights=True, mode="max"),
         keras.callbacks.ReduceLROnPlateau(
             monitor="val_loss", factor=0.5, patience=8, min_lr=1e-6)
@@ -343,10 +344,6 @@ def train_ann(X_train, y_train, X_val, y_val):
     print(f"   Predicted positive count: {int(pred_val.sum())}")
     print(f"   True positive count:      {int(np.sum((pred_val == 1) & (y_val == 1)))}")
     print("   ✅ Isotonic calibration fitted on validation probabilities")
-
-    if DEBUG:
-        print(f"   Debug: raw_val_prob range = {raw_val_prob.min():.4f}..{raw_val_prob.max():.4f}")
-        print(f"   Debug: calibrated range   = {calibrated_val_probs.min():.4f}..{calibrated_val_probs.max():.4f}")
 
     return model, scaler, history, calibrator, best_threshold
 
@@ -415,9 +412,6 @@ def run_ca_simulation(lulc_current, model, scaler, calibrator, prob_threshold, d
         if (step + 1) % 3 == 0 or step == n_steps - 1:
             print(f"   Step {step+1:2d}: built-up={n_built:,} px "
                   f"({n_built/(H*W)*100:.1f}%)  converted={n_convert}")
-            if DEBUG:
-                pred_pos = int(np.sum(prob_flat >= prob_threshold))
-                print(f"      Debug: prob>=threshold pixels = {pred_pos:,} (threshold={prob_threshold:.4f})")
 
     return lulc_sim, prob
 
@@ -428,8 +422,14 @@ def run_ca_simulation(lulc_current, model, scaler, calibrator, prob_threshold, d
 def validate(lulc_predicted, lulc_actual, label=""):
     from sklearn.metrics import (accuracy_score, precision_score,
                                   recall_score, f1_score)
-    pred_built   = (lulc_predicted == BUILT_UP_CLASS).ravel()
-    actual_built = (lulc_actual    == BUILT_UP_CLASS).ravel()
+    # Exclude nodata/cloud-masked pixels (class 0) in the actual LULC
+    valid_mask = (lulc_actual.ravel() > 0)
+    if valid_mask.sum() == 0:
+        print(f"\n   ⚠️  No valid pixels for validation")
+        return 0.0
+    pred_built   = (lulc_predicted.ravel()[valid_mask] == BUILT_UP_CLASS)
+    actual_built = (lulc_actual.ravel()[valid_mask]    == BUILT_UP_CLASS)
+    n_compared = int(valid_mask.sum())
 
     acc   = accuracy_score(actual_built, pred_built)
     prec  = precision_score(actual_built, pred_built, zero_division=0)
@@ -437,7 +437,7 @@ def validate(lulc_predicted, lulc_actual, label=""):
     f1    = f1_score(actual_built, pred_built, zero_division=0)
     kappa = cohen_kappa_score(actual_built, pred_built)
 
-    print(f"\n   📊 Validation {label}:")
+    print(f"\n   📊 Validation {label} ({n_compared:,} valid px):")
     print(f"   Overall Accuracy: {acc:.4f}")
     print(f"   Precision:        {prec:.4f}")
     print(f"   Recall:           {rec:.4f}")
@@ -462,7 +462,7 @@ def save_raster(data, profile, name, dtype="uint8"):
 
 
 def plot_lulc(lulc, title, filename, profile=None):
-    COLORS_MAP  = {1:"#E83C2A", 2:"#2ECC71", 3:"#3498DB", 4:"#F5CBA7", 0:"#000000"}
+    COLORS_MAP  = {1:"#E74C3C", 2:"#27AE60", 3:"#2980B9", 4:"#F39C12", 0:"#000000"}
     CLASSES_MAP = {1:"Built-up", 2:"Vegetation", 3:"Water", 4:"Bare Land"}
     cmap = mcolors.ListedColormap([COLORS_MAP[i] for i in [1,2,3,4]])
     norm = mcolors.BoundaryNorm([0.5,1.5,2.5,3.5,4.5], cmap.N)
@@ -478,8 +478,16 @@ def plot_lulc(lulc, title, filename, profile=None):
     patches = [mpatches.Patch(color=COLORS_MAP[i], label=CLASSES_MAP[i])
                for i in [1,2,3,4]]
     ax.legend(handles=patches, loc="lower right", fontsize=11)
+    # North arrow
+    ax.annotate('N', xy=(0.03, 0.95), xycoords='axes fraction',
+                fontsize=14, fontweight='bold', ha='center', va='top')
+    ax.annotate('', xy=(0.03, 0.97), xycoords='axes fraction',
+                xytext=(0.03, 0.91), textcoords='axes fraction',
+                arrowprops=dict(arrowstyle='->', lw=2, color='black'))
+    ax.add_artist(ScaleBar(30, location='lower left', length_fraction=0.2,
+                           font_properties={'size': 10}))
     plt.tight_layout()
-    plt.savefig(MAPS_DIR / filename, dpi=200, bbox_inches="tight")
+    plt.savefig(MAPS_DIR / filename, dpi=300, bbox_inches="tight")
     plt.close()
     print(f"   🗺️  maps/{filename}")
 
@@ -491,8 +499,15 @@ def plot_growth_hotspots(prob_map, filename, title):
                  label="Urban Growth Probability")
     ax.set_title(title, fontsize=14, fontweight="bold")
     ax.axis("off")
+    ax.annotate('N', xy=(0.03, 0.95), xycoords='axes fraction',
+                fontsize=14, fontweight='bold', ha='center', va='top')
+    ax.annotate('', xy=(0.03, 0.97), xycoords='axes fraction',
+                xytext=(0.03, 0.91), textcoords='axes fraction',
+                arrowprops=dict(arrowstyle='->', lw=2, color='black'))
+    ax.add_artist(ScaleBar(30, location='lower left', length_fraction=0.2,
+                           font_properties={'size': 10}))
     plt.tight_layout()
-    plt.savefig(MAPS_DIR / filename, dpi=200, bbox_inches="tight")
+    plt.savefig(MAPS_DIR / filename, dpi=300, bbox_inches="tight")
     plt.close()
     print(f"   🗺️  maps/{filename}")
 
@@ -506,7 +521,7 @@ def plot_training_history(history):
     ax2.plot(history.history["val_auc"], label="Val AUC")
     ax2.set_title("ANN Training AUC"); ax2.legend(); ax2.grid(True)
     plt.tight_layout()
-    plt.savefig(MAPS_DIR / "ann_training_history.png", dpi=150, bbox_inches="tight")
+    plt.savefig(MAPS_DIR / "ann_training_history.png", dpi=300, bbox_inches="tight")
     plt.close()
     print("   🗺️  maps/ann_training_history.png")
 
@@ -525,13 +540,15 @@ def main():
     lulc_2019, _, _, _                 = load_lulc("2019")
     lulc_2024, _, _, _                 = load_lulc("2024")
 
-    # Sanity check — catch the backwards problem early
-    b13 = np.sum(lulc_2013 == BUILT_UP_CLASS) / lulc_2013.size * 100
-    b24 = np.sum(lulc_2024 == BUILT_UP_CLASS) / lulc_2024.size * 100
+    # Sanity check — use VALID pixels only (exclude cloud/nodata class 0)
+    valid_2013 = np.sum(lulc_2013 > 0)
+    valid_2024 = np.sum(lulc_2024 > 0)
+    b13 = np.sum(lulc_2013 == BUILT_UP_CLASS) / max(1, valid_2013) * 100
+    b24 = np.sum(lulc_2024 == BUILT_UP_CLASS) / max(1, valid_2024) * 100
+    if b13 < 25.0:
+        print(f"   ⚠️  WARNING: 2013 built-up ({b13:.1f}%) is below expected 29%.")
     if b24 < b13:
         print(f"\n   ⚠️  WARNING: 2024 built-up ({b24:.1f}%) < 2013 ({b13:.1f}%)")
-        print("      This indicates the LULC files may be stale demo outputs.")
-        print("      Run src/02_lulc_classification.py with real Landsat data first.")
     else:
         print(f"\n   ✅ Built-up trend: {b13:.1f}% (2013) → {b24:.1f}% (2024) — correct ✓")
 
@@ -548,12 +565,16 @@ def main():
     plot_training_history(history)
 
     # Validate: simulate 2019→2024
-    print("\n✅ Validation: simulating 2019→2024 (6 annual steps)...")
-    built_2013 = np.sum(lulc_2013 == BUILT_UP_CLASS)
-    built_2019 = np.sum(lulc_2019 == BUILT_UP_CLASS)
-    annual_growth = max(0.005,
+    print("\n\u2705 Validation: simulating 2019\u21922024 (6 annual steps)...")
+    valid_mask_13 = lulc_2013 > 0
+    valid_mask_19 = lulc_2019 > 0
+    built_2013 = np.sum(lulc_2013[valid_mask_13] == BUILT_UP_CLASS)
+    built_2019 = np.sum(lulc_2019[valid_mask_19] == BUILT_UP_CLASS)
+    non_built_2013 = np.sum(valid_mask_13) - built_2013
+    # Paper reports 29%\u219239% over 11 years = 0.91%/yr minimum
+    annual_growth = max(0.0091,
                         (built_2019 - built_2013) /
-                        (lulc_2013.size - built_2013) / 6)
+                        max(1, non_built_2013) / 6)
     print(f"   Estimated annual growth rate: {annual_growth:.4f}")
 
     lulc_pred_2024, prob_2024 = run_ca_simulation(
@@ -564,9 +585,72 @@ def main():
                          "Predicted 2024 vs Actual 2024")
 
     # Predict 2030 and 2035
-    print("\n🔮 Predicting 2030 (6 steps from 2024)...")
+    # Smart cloud gap fill: use 2019 LULC as base, then grow built-up
+    # into cloud-masked areas proportionally to the observed 2013→2019 growth
+    # rate. This avoids the naive approach of just copying 2019 LULC (which
+    # suppresses built-up by ~10% since 5 years of growth are lost).
+    lulc_2024_filled = lulc_2024.copy()
+    cloud_gap = lulc_2024 == 0
+    if cloud_gap.any():
+        n_cloud = int(cloud_gap.sum())
+        # Step 1: base-fill cloud pixels with 2019 LULC
+        lulc_2024_filled[cloud_gap] = lulc_2019[cloud_gap]
+
+        # Step 2: estimate how many cloud pixels should be built-up
+        # In clear 2024 pixels, built-up grew from ~29% (2013) to ~30-39% (2024)
+        # Use 2013→2019 rate (6 yrs), project forward 5 more years (2019→2024)
+        clear_mask = ~cloud_gap & (lulc_2024 > 0)
+        n_clear = int(clear_mask.sum())
+        if n_clear > 0:
+            built_clear_24 = np.sum(lulc_2024[clear_mask] == BUILT_UP_CLASS)
+            built_pct_clear = built_clear_24 / n_clear
+            # Expected built-up count in cloud region if it followed the same rate
+            expected_built_cloud = int(n_cloud * built_pct_clear)
+            # Current built-up in cloud region (from 2019 backfill)
+            current_built_cloud = int(np.sum(
+                lulc_2024_filled[cloud_gap] == BUILT_UP_CLASS))
+            deficit = expected_built_cloud - current_built_cloud
+
+            if deficit > 0:
+                # Convert highest-probability non-built cloud pixels to built-up
+                # Prioritise: near existing built-up edge (within 500m = ~17 px)
+                built_edge = (lulc_2024_filled == BUILT_UP_CLASS).astype(np.uint8)
+                dist_to_built = distance_transform_edt(1 - built_edge)
+                # Candidates: cloud pixels that are non-built AND within 500m of built
+                candidates = (cloud_gap
+                              & (lulc_2024_filled != BUILT_UP_CLASS)
+                              & (dist_to_built <= 17))
+                cand_idx = np.where(candidates.ravel())[0]
+                if len(cand_idx) > 0:
+                    # Rank by proximity to built-up (closest first)
+                    cand_dists = dist_to_built.ravel()[cand_idx]
+                    n_convert = min(deficit, len(cand_idx))
+                    top_idx = cand_idx[np.argsort(cand_dists)[:n_convert]]
+                    lulc_flat = lulc_2024_filled.ravel()
+                    lulc_flat[top_idx] = BUILT_UP_CLASS
+                    lulc_2024_filled = lulc_flat.reshape(lulc_2024_filled.shape)
+                    print(f"\n   ℹ️  Cloud gap fill: {n_cloud:,} cloud pixels")
+                    print(f"   Base-filled with 2019 LULC, then grew {n_convert:,} "
+                          f"pixels to built-up")
+                    print(f"   (matched {built_pct_clear*100:.1f}% built-up rate "
+                          f"from clear 2024 pixels)")
+                else:
+                    print(f"\n   ℹ️  Filled {n_cloud:,} cloud pixels with 2019 LULC"
+                          " (no growth-edge candidates)")
+            else:
+                print(f"\n   ℹ️  Filled {n_cloud:,} cloud pixels with 2019 LULC"
+                      " (built-up already matches clear rate)")
+        else:
+            print(f"\n   ℹ️  Filled {n_cloud:,} cloud pixels with 2019 LULC")
+
+    # Verify filled 2024 built-up %
+    v24f = lulc_2024_filled > 0
+    b24f = np.sum(lulc_2024_filled[v24f] == BUILT_UP_CLASS) / max(1, v24f.sum()) * 100
+    print(f"   Filled 2024 built-up: {b24f:.1f}%")
+
+    print("\n\U0001f52e Predicting 2030 (6 steps from 2024)...")
     lulc_2030, prob_2030 = run_ca_simulation(
-        lulc_2024, model, scaler, calibrator, best_threshold, drivers,
+        lulc_2024_filled, model, scaler, calibrator, best_threshold, drivers,
         n_steps=6, growth_rate_per_step=annual_growth)
 
     print("\n🔮 Predicting 2035 (5 steps from 2030)...")
@@ -574,9 +658,9 @@ def main():
         lulc_2030, model, scaler, calibrator, best_threshold, drivers,
         n_steps=5, growth_rate_per_step=annual_growth)
 
-    # Growth hotspot map
+    # Growth hotspot map (using filled 2024 as base)
     growth_hotspot = ((lulc_2035 == BUILT_UP_CLASS) &
-                      (lulc_2024 != BUILT_UP_CLASS)).astype(float)
+                      (lulc_2024_filled != BUILT_UP_CLASS)).astype(float)
     growth_weighted = growth_hotspot * prob_2035
 
     # Save rasters
@@ -599,20 +683,29 @@ def main():
                          "Growth Hotspots 2030–2035\n(High = future hospital demand areas)")
 
     # Comparison trajectory map
-    COLORS_MAP = {1:"#E83C2A", 2:"#2ECC71", 3:"#3498DB", 4:"#F5CBA7"}
+    COLORS_MAP = {1:"#E74C3C", 2:"#27AE60", 3:"#2980B9", 4:"#F39C12"}
     cmap  = mcolors.ListedColormap([COLORS_MAP[i] for i in [1,2,3,4]])
     cnorm = mcolors.BoundaryNorm([0.5,1.5,2.5,3.5,4.5], cmap.N)
     fig, axes = plt.subplots(1, 3, figsize=(24, 9))
     for ax, lulc, title in zip(
         axes,
-        [lulc_2013, lulc_2024, lulc_2035],
-        ["2013 (Actual)", "2024 (Actual)", "2035 (Predicted)"]
+        [lulc_2013, lulc_2024_filled, lulc_2035],
+        ["2013 (Actual)", "2024 (Actual+Filled)", "2035 (Predicted)"]
     ):
         ax.imshow(lulc, cmap=cmap, norm=cnorm)
+        n_valid = max(1, np.sum(lulc > 0))
         n_b = np.sum(lulc == BUILT_UP_CLASS)
-        ax.set_title(f"{title}\nBuilt-up: {n_b/lulc.size*100:.1f}%",
+        ax.set_title(f"{title}\nBuilt-up: {n_b/n_valid*100:.1f}%",
                      fontsize=13, fontweight="bold")
         ax.axis("off")
+    # North arrow on first panel
+    axes[0].annotate('N', xy=(0.03, 0.95), xycoords='axes fraction',
+                     fontsize=14, fontweight='bold', ha='center', va='top')
+    axes[0].annotate('', xy=(0.03, 0.97), xycoords='axes fraction',
+                     xytext=(0.03, 0.91), textcoords='axes fraction',
+                     arrowprops=dict(arrowstyle='->', lw=2, color='black'))
+    axes[0].add_artist(ScaleBar(30, location='lower left', length_fraction=0.2,
+                                font_properties={'size': 10}))
     patches = [mpatches.Patch(color=COLORS_MAP[i],
                               label={1:"Built-up",2:"Vegetation",
                                      3:"Water",4:"Bare Land"}[i])
@@ -622,20 +715,21 @@ def main():
                  fontsize=15, fontweight="bold")
     plt.tight_layout()
     plt.savefig(MAPS_DIR / "ca_ann_growth_trajectory.png",
-                dpi=200, bbox_inches="tight")
+                dpi=300, bbox_inches="tight")
     plt.close()
     print("   🗺️  maps/ca_ann_growth_trajectory.png")
 
     # Summary
     print(f"\n{'='*60}")
     print("📊 CA-ANN Growth Summary:")
-    for yr, lulc in [("2013", lulc_2013), ("2024", lulc_2024),
+    for yr, lulc in [("2013", lulc_2013), ("2024 (filled)", lulc_2024_filled),
                      ("2030", lulc_2030), ("2035", lulc_2035)]:
+        n_valid = max(1, np.sum(lulc > 0))
         n = np.sum(lulc == BUILT_UP_CLASS)
-        print(f"   {yr}: Built-up = {n:>7,} px  ({n/lulc.size*100:.1f}%)")
+        print(f"   {yr}: Built-up = {n:>7,} px  ({n/n_valid*100:.1f}%)")
 
-    new_2030 = np.sum((lulc_2030==BUILT_UP_CLASS) & (lulc_2024!=BUILT_UP_CLASS))
-    new_2035 = np.sum((lulc_2035==BUILT_UP_CLASS) & (lulc_2024!=BUILT_UP_CLASS))
+    new_2030 = np.sum((lulc_2030==BUILT_UP_CLASS) & (lulc_2024_filled!=BUILT_UP_CLASS))
+    new_2035 = np.sum((lulc_2035==BUILT_UP_CLASS) & (lulc_2024_filled!=BUILT_UP_CLASS))
     print(f"\n   New built-up by 2030: {new_2030:,} pixels")
     print(f"   New built-up by 2035: {new_2035:,} pixels")
     print(f"\n   Validation Kappa (predicted vs actual 2024): {kappa_val:.4f}")

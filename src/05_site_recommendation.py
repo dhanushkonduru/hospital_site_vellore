@@ -13,6 +13,7 @@ Pipeline:
 6. Generate final recommendation map for IEEE paper
 """
 
+import json
 import numpy as np
 import rasterio
 from rasterio.features import shapes, rasterize
@@ -24,6 +25,7 @@ import matplotlib.pyplot as plt
 import matplotlib.colors as mcolors
 import matplotlib.patches as mpatches
 from matplotlib.lines import Line2D
+from matplotlib_scalebar.scalebar import ScaleBar
 from pathlib import Path
 import warnings
 warnings.filterwarnings("ignore")
@@ -31,7 +33,7 @@ warnings.filterwarnings("ignore")
 # ── Paths ─────────────────────────────────────────────────
 AHP_DIR  = Path("data/processed/ahp")
 CA_DIR   = Path("data/processed/ca_ann")
-LULC_DIR = Path("data/processed/lulc_production")
+LULC_DIR = Path("data/processed/lulc")
 PROC_DIR = Path("data/processed")
 SITES_DIR = Path("data/processed/sites")
 MAPS_DIR  = Path("maps")
@@ -332,9 +334,18 @@ def final_map(suitability, classified, top5, hospitals_gdf,
         fontsize=13, fontweight="bold", pad=12)
     ax.axis("off")
 
+    # North arrow
+    ax.annotate('N', xy=(0.03, 0.95), xycoords='axes fraction',
+                fontsize=14, fontweight='bold', ha='center', va='top')
+    ax.annotate('', xy=(0.03, 0.97), xycoords='axes fraction',
+                xytext=(0.03, 0.91), textcoords='axes fraction',
+                arrowprops=dict(arrowstyle='->', lw=2, color='black'))
+    ax.add_artist(ScaleBar(30, location='lower left', length_fraction=0.15,
+                           font_properties={'size': 10}))
+
     plt.tight_layout()
     plt.savefig(MAPS_DIR / "final_recommendation_map.png",
-                dpi=200, bbox_inches="tight")
+                dpi=300, bbox_inches="tight")
     plt.close()
     print("   🗺️  maps/final_recommendation_map.png")
 
@@ -385,7 +396,7 @@ def site_comparison_chart(top5, coverage_results):
                  fontsize=14, fontweight="bold")
     plt.tight_layout()
     plt.savefig(MAPS_DIR / "site_comparison_chart.png",
-                dpi=200, bbox_inches="tight")
+                dpi=300, bbox_inches="tight")
     plt.close()
     print("   🗺️  maps/site_comparison_chart.png")
 
@@ -515,7 +526,23 @@ def main():
     print(f"   Time period: 2013 → 2024 → 2035 (predicted)")
     print()
     print(f"   LULC Results:")
-    print(f"   Built-up growth: 28.2% (2013) → 38.8% (2024) → 32.2% (2035 pred)")
+    # Load actual built-up percentages from pipeline outputs
+    acc_path = LULC_DIR / "accuracy_summary.json"
+    b13_pct = b24_pct = "?"
+    if acc_path.exists():
+        with open(acc_path) as f:
+            acc = json.load(f)
+        b13_pct = acc.get("2013", {}).get("built_up_pct", "?")
+        b24_pct = acc.get("2024", {}).get("built_up_pct", "?")
+    b35_pct = "?"
+    lulc35 = CA_DIR / "lulc_predicted_2035.tif"
+    if lulc35.exists():
+        with rasterio.open(lulc35) as src:
+            arr35 = src.read(1)
+            v35 = arr35[arr35 > 0]
+            if len(v35):
+                b35_pct = round((v35 == 1).sum() / len(v35) * 100, 1)
+    print(f"   Built-up growth: {b13_pct}% (2013) → {b24_pct}% (2024) → {b35_pct}% (2035 pred)")
     print()
     print(f"   AHP Analysis:")
     print(f"   CR = 0.0117 ✅  |  6 criteria  |  Weights sum = 1.0")

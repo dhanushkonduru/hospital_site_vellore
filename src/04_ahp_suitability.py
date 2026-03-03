@@ -25,12 +25,13 @@ import matplotlib.pyplot as plt
 import matplotlib.colors as mcolors
 import matplotlib.patches as mpatches
 from matplotlib.colors import LinearSegmentedColormap
+from matplotlib_scalebar.scalebar import ScaleBar
 from pathlib import Path
 import warnings
 warnings.filterwarnings("ignore")
 
 # ── Paths ─────────────────────────────────────────────────
-LULC_DIR   = Path("data/processed/lulc_production")
+LULC_DIR   = Path("data/processed/lulc")
 CA_DIR     = Path("data/processed/ca_ann")
 PROC_DIR   = Path("data/processed")
 AHP_DIR    = Path("data/processed/ahp")
@@ -329,11 +330,20 @@ def plot_criteria_grid(criteria_list, names):
         ax.axis("off")
         plt.colorbar(im, ax=ax, fraction=0.046, pad=0.04)
 
+    # North arrow + scale bar on first panel
+    axes[0].annotate('N', xy=(0.03, 0.93), xycoords='axes fraction',
+                     fontsize=12, fontweight='bold', ha='center', va='top')
+    axes[0].annotate('', xy=(0.03, 0.95), xycoords='axes fraction',
+                     xytext=(0.03, 0.89), textcoords='axes fraction',
+                     arrowprops=dict(arrowstyle='->', lw=1.5, color='black'))
+    axes[0].add_artist(ScaleBar(30, location='lower left', length_fraction=0.25,
+                                font_properties={'size': 8}))
+
     plt.suptitle("AHP Criteria Layers — Vellore Hospital Suitability",
                  fontsize=15, fontweight="bold")
     plt.tight_layout()
     plt.savefig(MAPS_DIR / "ahp_criteria_grid.png",
-                dpi=200, bbox_inches="tight")
+                dpi=300, bbox_inches="tight")
     plt.close()
     print("   🗺️  maps/ahp_criteria_grid.png")
 
@@ -380,11 +390,20 @@ def plot_suitability(suitability, classified):
     ax2.legend(handles=patches, loc="lower right",
                fontsize=11, framealpha=0.9)
 
+    # North arrow + scale bar on first panel
+    ax1.annotate('N', xy=(0.03, 0.95), xycoords='axes fraction',
+                 fontsize=14, fontweight='bold', ha='center', va='top')
+    ax1.annotate('', xy=(0.03, 0.97), xycoords='axes fraction',
+                 xytext=(0.03, 0.91), textcoords='axes fraction',
+                 arrowprops=dict(arrowstyle='->', lw=2, color='black'))
+    ax1.add_artist(ScaleBar(30, location='lower left', length_fraction=0.2,
+                            font_properties={'size': 10}))
+
     plt.suptitle("Hospital Site Suitability Analysis — Vellore 2024→2035",
                  fontsize=15, fontweight="bold")
     plt.tight_layout()
     plt.savefig(MAPS_DIR / "suitability_map.png",
-                dpi=200, bbox_inches="tight")
+                dpi=300, bbox_inches="tight")
     plt.close()
     print("   🗺️  maps/suitability_map.png")
 
@@ -419,7 +438,7 @@ def plot_weights_bar(weights, CR):
 
     plt.tight_layout()
     plt.savefig(MAPS_DIR / "ahp_weights_chart.png",
-                dpi=200, bbox_inches="tight")
+                dpi=300, bbox_inches="tight")
     plt.close()
     print("   🗺️  maps/ahp_weights_chart.png")
 

@@ -1,20 +1,20 @@
 {
   "2013": {
-    "overall_accuracy_pct": 76.6,
-    "kappa": 0.6885,
-    "built_up_pct": 19.5,
-    "built_up_km2": 95.3
+    "overall_accuracy_pct": 85.0,
+    "kappa": 0.7791,
+    "built_up_pct": 29.6,
+    "built_up_km2": 142.1
   },
   "2019": {
-    "overall_accuracy_pct": 78.7,
-    "kappa": 0.7158,
-    "built_up_pct": 19.4,
-    "built_up_km2": 94.6
+    "overall_accuracy_pct": 85.1,
+    "kappa": 0.8014,
+    "built_up_pct": 28.1,
+    "built_up_km2": 136.8
   },
   "2024": {
-    "overall_accuracy_pct": 69.8,
-    "kappa": 0.5974,
-    "built_up_pct": 20.2,
-    "built_up_km2": 98.9
+    "overall_accuracy_pct": 84.5,
+    "kappa": 0.7941,
+    "built_up_pct": 27.3,
+    "built_up_km2": 73.6
   }
 }
