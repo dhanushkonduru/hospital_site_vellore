@@ -60,10 +60,20 @@ import matplotlib
 matplotlib.use('Agg')
 import matplotlib.pyplot as plt
 import matplotlib.patches as mpatches
-from matplotlib_scalebar.scalebar import ScaleBar
 from scipy.ndimage import generic_filter, uniform_filter
+from map_pub_utils import (
+    set_publication_style,
+    raster_extent,
+    load_boundary_layers,
+    add_boundary_overlays,
+    add_north_arrow,
+    add_scale_bar,
+    style_map_axis,
+    save_publication_figure,
+)
 
 warnings.filterwarnings('ignore')
+set_publication_style()
 
 import rasterio
 from rasterio.mask import mask as rio_mask
@@ -465,7 +475,7 @@ def save_accuracy_json(results):
 # VALIDATION MAP
 # ══════════════════════════════════════════════════════════════════════════════
 
-def save_map(pred_map, year, kappa, oa):
+def save_map(pred_map, year, kappa, oa, profile):
     if not CONFIG["save_maps"]:
         return
     H, W = pred_map.shape
@@ -474,23 +484,27 @@ def save_map(pred_map, year, kappa, oa):
         r, g, b = int(hx[1:3],16), int(hx[3:5],16), int(hx[5:7],16)
         rgb[pred_map == cls] = [r, g, b]
 
-    fig, ax = plt.subplots(figsize=(10, 10))
-    ax.imshow(rgb);  ax.axis('off')
-    ax.set_title(f"LULC Classification — Vellore {year}\nOA = {oa*100:.1f}%   κ = {kappa:.4f}",
-                 fontsize=13, fontweight='bold', pad=10)
+    fig, ax = plt.subplots(figsize=(8, 8), dpi=300)
+    extent = raster_extent(profile, pred_map.shape)
+    ax.imshow(rgb, extent=extent, origin="upper")
+    ax.set_xlim(extent[0], extent[1])
+    ax.set_ylim(extent[2], extent[3])
+
+    study_gdf, admin_gdf, label_col = load_boundary_layers()
+    add_boundary_overlays(ax, study_gdf, admin_gdf, label_col)
+    style_map_axis(
+        ax,
+        f"LULC Classification — Vellore {year}\nOA = {oa*100:.1f}%   κ = {kappa:.4f}",
+    )
+
     patches = [mpatches.Patch(color=COLORS[c], label=CLASSES[c]) for c in sorted(CLASSES)]
-    ax.legend(handles=patches, loc='lower right', fontsize=10, framealpha=0.92)
-    # North arrow
-    ax.annotate('N', xy=(0.03, 0.95), xycoords='axes fraction',
-                fontsize=14, fontweight='bold', ha='center', va='top')
-    ax.annotate('', xy=(0.03, 0.97), xycoords='axes fraction',
-                xytext=(0.03, 0.91), textcoords='axes fraction',
-                arrowprops=dict(arrowstyle='->', lw=2, color='black'))
-    # Scale bar (30m per pixel)
-    ax.add_artist(ScaleBar(30, location='lower left', length_fraction=0.2,
-                           font_properties={'size': 10}))
+    ax.legend(handles=patches, loc='lower right', fontsize=8, framealpha=0.92)
+    add_north_arrow(ax)
+    add_scale_bar(ax)
+
     out = os.path.join(PATHS["maps_out"], f"lulc_{year}_classified.png")
-    plt.tight_layout();  plt.savefig(out, dpi=300, bbox_inches='tight');  plt.close()
+    plt.tight_layout()
+    save_publication_figure(fig, out)
     print(f"  Map         → {out}")
 
 
@@ -692,7 +706,7 @@ def process_year(year, cfg):
         dst.write(pred_map, 1)
     print(f"  GeoTIFF     → {tif_path}")
 
-    save_map(pred_map, year, kappa, oa)
+    save_map(pred_map, year, kappa, oa, profile)
     return {"kappa": kappa, "oa": oa,
             "built_up_pct": round(built_pct,1), "built_up_km2": round(built_km2,1)}
 

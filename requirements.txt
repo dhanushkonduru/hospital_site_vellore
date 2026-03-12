@@ -10,3 +10,4 @@ matplotlib
 pyproj
 shapely
 rasterstats
+matplotlib-scalebar

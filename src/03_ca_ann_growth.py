@@ -36,11 +36,22 @@ import matplotlib.pyplot as plt
 import matplotlib.colors as mcolors
 import matplotlib.patches as mpatches
 from matplotlib.lines import Line2D
-from matplotlib_scalebar.scalebar import ScaleBar
 from pathlib import Path
 import glob, warnings, os
+from map_pub_utils import (
+    set_publication_style,
+    raster_extent,
+    load_boundary_layers,
+    add_boundary_overlays,
+    add_north_arrow,
+    add_scale_bar,
+    style_map_axis,
+    add_standard_colorbar,
+    save_publication_figure,
+)
 warnings.filterwarnings("ignore")
 os.environ["TF_CPP_MIN_LOG_LEVEL"] = "2"
+set_publication_style()
 
 # ── Paths ─────────────────────────────────────────────────────────────────────
 LULC_DIR  = Path("data/processed/lulc")
@@ -469,46 +480,48 @@ def plot_lulc(lulc, title, filename, profile=None):
     counts = {CLASSES_MAP[i]: np.sum(lulc==i) for i in [1,2,3,4]}
     total  = sum(counts.values())
     stats  = "\n".join([f"{k}: {v/total*100:.1f}%" for k,v in counts.items()])
-    fig, ax = plt.subplots(figsize=(10,10))
-    ax.imshow(lulc, cmap=cmap, norm=norm)
-    ax.set_title(title, fontsize=14, fontweight="bold")
+    fig, ax = plt.subplots(figsize=(8, 8), dpi=300)
+    extent = raster_extent(profile, lulc.shape) if profile is not None else None
+    if extent is not None:
+        ax.imshow(lulc, cmap=cmap, norm=norm, extent=extent, origin="upper")
+        ax.set_xlim(extent[0], extent[1])
+        ax.set_ylim(extent[2], extent[3])
+    else:
+        ax.imshow(lulc, cmap=cmap, norm=norm)
+
+    study_gdf, admin_gdf, label_col = load_boundary_layers()
+    add_boundary_overlays(ax, study_gdf, admin_gdf, label_col)
+    style_map_axis(ax, title)
     ax.text(0.02, 0.98, stats, transform=ax.transAxes, fontsize=10,
             va="top", bbox=dict(boxstyle="round", facecolor="white", alpha=0.9))
-    ax.axis("off")
     patches = [mpatches.Patch(color=COLORS_MAP[i], label=CLASSES_MAP[i])
                for i in [1,2,3,4]]
-    ax.legend(handles=patches, loc="lower right", fontsize=11)
-    # North arrow
-    ax.annotate('N', xy=(0.03, 0.95), xycoords='axes fraction',
-                fontsize=14, fontweight='bold', ha='center', va='top')
-    ax.annotate('', xy=(0.03, 0.97), xycoords='axes fraction',
-                xytext=(0.03, 0.91), textcoords='axes fraction',
-                arrowprops=dict(arrowstyle='->', lw=2, color='black'))
-    ax.add_artist(ScaleBar(30, location='lower left', length_fraction=0.2,
-                           font_properties={'size': 10}))
+    ax.legend(handles=patches, loc="lower right", fontsize=8)
+    add_north_arrow(ax)
+    add_scale_bar(ax)
     plt.tight_layout()
-    plt.savefig(MAPS_DIR / filename, dpi=300, bbox_inches="tight")
-    plt.close()
+    save_publication_figure(fig, MAPS_DIR / filename)
     print(f"   🗺️  maps/{filename}")
 
 
-def plot_growth_hotspots(prob_map, filename, title):
-    fig, ax = plt.subplots(figsize=(10,10))
-    im = ax.imshow(prob_map, cmap=GROWTH_CMAP, vmin=0, vmax=1)
-    plt.colorbar(im, ax=ax, fraction=0.046, pad=0.04,
-                 label="Urban Growth Probability")
-    ax.set_title(title, fontsize=14, fontweight="bold")
-    ax.axis("off")
-    ax.annotate('N', xy=(0.03, 0.95), xycoords='axes fraction',
-                fontsize=14, fontweight='bold', ha='center', va='top')
-    ax.annotate('', xy=(0.03, 0.97), xycoords='axes fraction',
-                xytext=(0.03, 0.91), textcoords='axes fraction',
-                arrowprops=dict(arrowstyle='->', lw=2, color='black'))
-    ax.add_artist(ScaleBar(30, location='lower left', length_fraction=0.2,
-                           font_properties={'size': 10}))
+def plot_growth_hotspots(prob_map, filename, title, profile=None):
+    fig, ax = plt.subplots(figsize=(8, 8), dpi=300)
+    extent = raster_extent(profile, prob_map.shape) if profile is not None else None
+    if extent is not None:
+        im = ax.imshow(prob_map, cmap=GROWTH_CMAP, vmin=0, vmax=1, extent=extent, origin="upper")
+        ax.set_xlim(extent[0], extent[1])
+        ax.set_ylim(extent[2], extent[3])
+    else:
+        im = ax.imshow(prob_map, cmap=GROWTH_CMAP, vmin=0, vmax=1)
+
+    add_standard_colorbar(fig, ax, im, "Urban Growth Probability")
+    study_gdf, admin_gdf, label_col = load_boundary_layers()
+    add_boundary_overlays(ax, study_gdf, admin_gdf, label_col)
+    style_map_axis(ax, title)
+    add_north_arrow(ax)
+    add_scale_bar(ax)
     plt.tight_layout()
-    plt.savefig(MAPS_DIR / filename, dpi=300, bbox_inches="tight")
-    plt.close()
+    save_publication_figure(fig, MAPS_DIR / filename)
     print(f"   🗺️  maps/{filename}")
 
 
@@ -675,48 +688,43 @@ def main():
 
     # Generate maps
     print("\n🗺️  Generating maps...")
-    plot_lulc(lulc_2030, "Predicted LULC — Vellore 2030", "lulc_predicted_2030.png")
-    plot_lulc(lulc_2035, "Predicted LULC — Vellore 2035", "lulc_predicted_2035.png")
+    plot_lulc(lulc_2030, "Predicted LULC — Vellore 2030", "lulc_predicted_2030.png", profile=profile)
+    plot_lulc(lulc_2035, "Predicted LULC — Vellore 2035", "lulc_predicted_2035.png", profile=profile)
     plot_growth_hotspots(prob_2030, "growth_probability_2030.png",
-                         "Urban Growth Probability — Vellore 2030")
+                         "Urban Growth Probability — Vellore 2030", profile=profile)
     plot_growth_hotspots(growth_weighted, "growth_hotspots_2030_2035.png",
-                         "Growth Hotspots 2030–2035\n(High = future hospital demand areas)")
+                         "Growth Hotspots 2030–2035\n(High = future hospital demand areas)", profile=profile)
 
     # Comparison trajectory map
     COLORS_MAP = {1:"#E74C3C", 2:"#27AE60", 3:"#2980B9", 4:"#F39C12"}
     cmap  = mcolors.ListedColormap([COLORS_MAP[i] for i in [1,2,3,4]])
     cnorm = mcolors.BoundaryNorm([0.5,1.5,2.5,3.5,4.5], cmap.N)
-    fig, axes = plt.subplots(1, 3, figsize=(24, 9))
+    fig, axes = plt.subplots(1, 3, figsize=(16, 6), dpi=300)
+    extent = raster_extent(profile, lulc_2013.shape)
+    study_gdf, admin_gdf, label_col = load_boundary_layers()
     for ax, lulc, title in zip(
         axes,
         [lulc_2013, lulc_2024_filled, lulc_2035],
         ["2013 (Actual)", "2024 (Actual+Filled)", "2035 (Predicted)"]
     ):
-        ax.imshow(lulc, cmap=cmap, norm=cnorm)
+        ax.imshow(lulc, cmap=cmap, norm=cnorm, extent=extent, origin="upper")
+        ax.set_xlim(extent[0], extent[1])
+        ax.set_ylim(extent[2], extent[3])
+        add_boundary_overlays(ax, study_gdf, admin_gdf, label_col)
         n_valid = max(1, np.sum(lulc > 0))
         n_b = np.sum(lulc == BUILT_UP_CLASS)
-        ax.set_title(f"{title}\nBuilt-up: {n_b/n_valid*100:.1f}%",
-                     fontsize=13, fontweight="bold")
-        ax.axis("off")
-    # North arrow on first panel
-    axes[0].annotate('N', xy=(0.03, 0.95), xycoords='axes fraction',
-                     fontsize=14, fontweight='bold', ha='center', va='top')
-    axes[0].annotate('', xy=(0.03, 0.97), xycoords='axes fraction',
-                     xytext=(0.03, 0.91), textcoords='axes fraction',
-                     arrowprops=dict(arrowstyle='->', lw=2, color='black'))
-    axes[0].add_artist(ScaleBar(30, location='lower left', length_fraction=0.2,
-                                font_properties={'size': 10}))
+        style_map_axis(ax, f"{title}\nBuilt-up: {n_b/n_valid*100:.1f}%")
+    add_north_arrow(axes[0])
+    add_scale_bar(axes[0])
     patches = [mpatches.Patch(color=COLORS_MAP[i],
                               label={1:"Built-up",2:"Vegetation",
                                      3:"Water",4:"Bare Land"}[i])
                for i in [1,2,3,4]]
-    axes[2].legend(handles=patches, loc="lower right", fontsize=11)
+    axes[2].legend(handles=patches, loc="lower right", fontsize=8)
     plt.suptitle("Vellore Urban Growth Trajectory — CA-ANN Model",
                  fontsize=15, fontweight="bold")
     plt.tight_layout()
-    plt.savefig(MAPS_DIR / "ca_ann_growth_trajectory.png",
-                dpi=300, bbox_inches="tight")
-    plt.close()
+    save_publication_figure(fig, MAPS_DIR / "ca_ann_growth_trajectory.png")
     print("   🗺️  maps/ca_ann_growth_trajectory.png")
 
     # Summary

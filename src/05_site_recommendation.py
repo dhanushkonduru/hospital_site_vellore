@@ -25,10 +25,21 @@ import matplotlib.pyplot as plt
 import matplotlib.colors as mcolors
 import matplotlib.patches as mpatches
 from matplotlib.lines import Line2D
-from matplotlib_scalebar.scalebar import ScaleBar
 from pathlib import Path
+from map_pub_utils import (
+    set_publication_style,
+    raster_extent,
+    load_boundary_layers,
+    add_boundary_overlays,
+    add_north_arrow,
+    add_scale_bar,
+    style_map_axis,
+    add_standard_colorbar,
+    save_publication_figure,
+)
 import warnings
 warnings.filterwarnings("ignore")
+set_publication_style()
 
 # ── Paths ─────────────────────────────────────────────────
 AHP_DIR  = Path("data/processed/ahp")
@@ -264,45 +275,44 @@ def final_map(suitability, classified, top5, hospitals_gdf,
     suit_cmap = mcolors.LinearSegmentedColormap.from_list(
         "suit", ["#D73027", "#FEE08B", "#A6D96A", "#1A9850"])
 
-    fig, ax = plt.subplots(figsize=(12, 12))
-    im = ax.imshow(suitability, cmap=suit_cmap, vmin=0, vmax=suitability.max(),
-                   alpha=0.85)
-    plt.colorbar(im, ax=ax, fraction=0.035, pad=0.02,
-                 label="Suitability Score")
+    fig, ax = plt.subplots(figsize=(8, 8), dpi=300)
+    extent = raster_extent(profile, suitability.shape)
+    im = ax.imshow(
+        suitability,
+        cmap=suit_cmap,
+        vmin=0,
+        vmax=suitability.max(),
+        alpha=0.85,
+        extent=extent,
+        origin="upper",
+    )
+    ax.set_xlim(extent[0], extent[1])
+    ax.set_ylim(extent[2], extent[3])
+    add_standard_colorbar(fig, ax, im, "Suitability Score")
 
     # Overlay existing hospitals
     hosp_crs = hospitals_gdf.to_crs(crs)
-    transform = profile["transform"]
-
-    def coord_to_px(x, y):
-        col = (x - transform.c) / transform.a
-        row = (y - transform.f) / transform.e
-        return col, row
 
     # Plot existing hospitals
     for _, hosp in hosp_crs.iterrows():
         if hosp.geometry.geom_type == "Point":
-            px_col, px_row = coord_to_px(hosp.geometry.x, hosp.geometry.y)
-            if 0 <= px_row < suitability.shape[0] and \
-               0 <= px_col < suitability.shape[1]:
-                ax.plot(px_col, px_row, "b+", markersize=6,
-                        markeredgewidth=1.2, alpha=0.6)
+            ax.plot(hosp.geometry.x, hosp.geometry.y, "b+", markersize=6,
+                    markeredgewidth=1.2, alpha=0.6, zorder=8)
 
     # Plot proposed sites
     site_colors = ["#FF0000", "#FF6B00", "#FFD700", "#00CC44", "#0066FF"]
     for _, site in top5.iterrows():
         cx, cy = site.geometry.centroid.x, site.geometry.centroid.y
-        px_col, px_row = coord_to_px(cx, cy)
         rank = site["site_rank"]
         color = site_colors[rank - 1]
 
-        ax.plot(px_col, px_row, "*", markersize=22,
+        ax.plot(cx, cy, "*", markersize=22,
                 color=color, markeredgecolor="black",
                 markeredgewidth=1.5, zorder=10)
         ax.annotate(
             f"  Site {rank}\n  Score: {site['mean_score']:.3f}\n"
             f"  {site['area_km2']:.3f} km²",
-            xy=(px_col, px_row),
+            xy=(cx, cy),
             fontsize=9, fontweight="bold",
             color="white",
             bbox=dict(boxstyle="round,pad=0.3",
@@ -323,36 +333,29 @@ def final_map(suitability, classified, top5, hospitals_gdf,
                    linewidth=0, markeredgecolor="black")
         )
     ax.legend(handles=legend_elements, loc="lower right",
-              fontsize=10, framealpha=0.92, title="Facilities",
+              fontsize=8, framealpha=0.92, title="Facilities",
               title_fontsize=11)
 
-    ax.set_title(
+    study_gdf, admin_gdf, label_col = load_boundary_layers()
+    add_boundary_overlays(ax, study_gdf, admin_gdf, label_col)
+    style_map_axis(
+        ax,
         "Recommended Hospital Sites — Vellore Urban Core\n"
         f"Based on CA-ANN Growth Prediction + AHP Analysis (2024–2035)\n"
         f"AHP CR = 0.0117  |  Thresholds: High ≥ {p85:.3f}, "
         f"Medium ≥ {p55:.3f}",
-        fontsize=13, fontweight="bold", pad=12)
-    ax.axis("off")
-
-    # North arrow
-    ax.annotate('N', xy=(0.03, 0.95), xycoords='axes fraction',
-                fontsize=14, fontweight='bold', ha='center', va='top')
-    ax.annotate('', xy=(0.03, 0.97), xycoords='axes fraction',
-                xytext=(0.03, 0.91), textcoords='axes fraction',
-                arrowprops=dict(arrowstyle='->', lw=2, color='black'))
-    ax.add_artist(ScaleBar(30, location='lower left', length_fraction=0.15,
-                           font_properties={'size': 10}))
+    )
+    add_north_arrow(ax)
+    add_scale_bar(ax)
 
     plt.tight_layout()
-    plt.savefig(MAPS_DIR / "final_recommendation_map.png",
-                dpi=300, bbox_inches="tight")
-    plt.close()
+    save_publication_figure(fig, MAPS_DIR / "final_recommendation_map.png")
     print("   🗺️  maps/final_recommendation_map.png")
 
 
 def site_comparison_chart(top5, coverage_results):
     """Bar chart comparing proposed sites for IEEE paper."""
-    fig, axes = plt.subplots(1, 3, figsize=(16, 6))
+    fig, axes = plt.subplots(1, 3, figsize=(12, 5), dpi=300)
 
     labels = [r["site_label"] for r in coverage_results]
     colors = ["#E74C3C", "#E67E22", "#F1C40F", "#2ECC71", "#3498DB"][:len(top5)]
@@ -393,11 +396,9 @@ def site_comparison_chart(top5, coverage_results):
         ax.spines["right"].set_visible(False)
 
     plt.suptitle("Proposed Hospital Site Comparison — Vellore",
-                 fontsize=14, fontweight="bold")
+                 fontsize=11, fontweight="bold")
     plt.tight_layout()
-    plt.savefig(MAPS_DIR / "site_comparison_chart.png",
-                dpi=300, bbox_inches="tight")
-    plt.close()
+    save_publication_figure(fig, MAPS_DIR / "site_comparison_chart.png")
     print("   🗺️  maps/site_comparison_chart.png")
 
 

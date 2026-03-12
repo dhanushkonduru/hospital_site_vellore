@@ -25,10 +25,21 @@ import matplotlib.pyplot as plt
 import matplotlib.colors as mcolors
 import matplotlib.patches as mpatches
 from matplotlib.colors import LinearSegmentedColormap
-from matplotlib_scalebar.scalebar import ScaleBar
 from pathlib import Path
+from map_pub_utils import (
+    set_publication_style,
+    raster_extent,
+    load_boundary_layers,
+    add_boundary_overlays,
+    add_north_arrow,
+    add_scale_bar,
+    style_map_axis,
+    add_standard_colorbar,
+    save_publication_figure,
+)
 import warnings
 warnings.filterwarnings("ignore")
+set_publication_style()
 
 # ── Paths ─────────────────────────────────────────────────
 LULC_DIR   = Path("data/processed/lulc")
@@ -317,55 +328,56 @@ def classify_suitability(suitability):
 # STEP 4 — MAPS
 # ════════════════════════════════════════════════════════════
 
-def plot_criteria_grid(criteria_list, names):
+def plot_criteria_grid(criteria_list, names, profile):
     """6-panel grid showing all criteria layers."""
-    fig, axes = plt.subplots(2, 3, figsize=(18, 12))
+    fig, axes = plt.subplots(2, 3, figsize=(12, 8), dpi=300)
     axes = axes.ravel()
+    extent = raster_extent(profile, criteria_list[0].shape)
+    study_gdf, admin_gdf, label_col = load_boundary_layers()
 
     cmap = plt.cm.RdYlGn  # red=low, green=high suitability
 
     for ax, crit, name in zip(axes, criteria_list, names):
-        im = ax.imshow(crit, cmap=cmap, vmin=0, vmax=1)
-        ax.set_title(name, fontsize=11, fontweight="bold")
-        ax.axis("off")
-        plt.colorbar(im, ax=ax, fraction=0.046, pad=0.04)
+        im = ax.imshow(crit, cmap=cmap, vmin=0, vmax=1, extent=extent, origin="upper")
+        ax.set_xlim(extent[0], extent[1])
+        ax.set_ylim(extent[2], extent[3])
+        add_boundary_overlays(ax, study_gdf, admin_gdf, label_col)
+        style_map_axis(ax, name)
+        add_standard_colorbar(fig, ax, im, "Criterion Score")
 
-    # North arrow + scale bar on first panel
-    axes[0].annotate('N', xy=(0.03, 0.93), xycoords='axes fraction',
-                     fontsize=12, fontweight='bold', ha='center', va='top')
-    axes[0].annotate('', xy=(0.03, 0.95), xycoords='axes fraction',
-                     xytext=(0.03, 0.89), textcoords='axes fraction',
-                     arrowprops=dict(arrowstyle='->', lw=1.5, color='black'))
-    axes[0].add_artist(ScaleBar(30, location='lower left', length_fraction=0.25,
-                                font_properties={'size': 8}))
+    add_north_arrow(axes[0])
+    add_scale_bar(axes[0])
 
     plt.suptitle("AHP Criteria Layers — Vellore Hospital Suitability",
                  fontsize=15, fontweight="bold")
     plt.tight_layout()
-    plt.savefig(MAPS_DIR / "ahp_criteria_grid.png",
-                dpi=300, bbox_inches="tight")
-    plt.close()
+    save_publication_figure(fig, MAPS_DIR / "ahp_criteria_grid.png")
     print("   🗺️  maps/ahp_criteria_grid.png")
 
 
-def plot_suitability(suitability, classified):
+def plot_suitability(suitability, classified, profile):
     """Two-panel: continuous score + classified High/Medium/Low."""
-    fig, (ax1, ax2) = plt.subplots(1, 2, figsize=(20, 9))
+    fig, (ax1, ax2) = plt.subplots(1, 2, figsize=(14, 7), dpi=300)
+    extent = raster_extent(profile, suitability.shape)
+    study_gdf, admin_gdf, label_col = load_boundary_layers()
 
     # Panel 1: continuous score
     cmap_cont = LinearSegmentedColormap.from_list(
         "suit", ["#D73027", "#FEE08B", "#1A9850"])
-    im = ax1.imshow(suitability, cmap=cmap_cont, vmin=0, vmax=1)
-    plt.colorbar(im, ax=ax1, fraction=0.046, pad=0.04,
-                 label="Suitability Score (0–1)")
-    ax1.set_title("Hospital Site Suitability Score\nVellore Urban Core",
-                  fontsize=13, fontweight="bold")
-    ax1.axis("off")
+    im = ax1.imshow(suitability, cmap=cmap_cont, vmin=0, vmax=1, extent=extent, origin="upper")
+    ax1.set_xlim(extent[0], extent[1])
+    ax1.set_ylim(extent[2], extent[3])
+    add_standard_colorbar(fig, ax1, im, "Suitability Score (0-1)")
+    add_boundary_overlays(ax1, study_gdf, admin_gdf, label_col)
+    style_map_axis(ax1, "Hospital Site Suitability Score\nVellore Urban Core")
 
     # Panel 2: classified
     class_cmap = mcolors.ListedColormap(["#D73027", "#FEE08B", "#1A9850"])
     class_norm = mcolors.BoundaryNorm([0.5, 1.5, 2.5, 3.5], class_cmap.N)
-    ax2.imshow(classified, cmap=class_cmap, norm=class_norm)
+    ax2.imshow(classified, cmap=class_cmap, norm=class_norm, extent=extent, origin="upper")
+    ax2.set_xlim(extent[0], extent[1])
+    ax2.set_ylim(extent[2], extent[3])
+    add_boundary_overlays(ax2, study_gdf, admin_gdf, label_col)
 
     counts = {
         "High (≥0.65)":   int(np.sum(classified == 3)),
@@ -378,9 +390,7 @@ def plot_suitability(suitability, classified):
     ax2.text(0.02, 0.98, stats, transform=ax2.transAxes,
              fontsize=10, va="top", fontfamily="monospace",
              bbox=dict(boxstyle="round", facecolor="white", alpha=0.9))
-    ax2.set_title("Suitability Classification\nHigh / Medium / Low",
-                  fontsize=13, fontweight="bold")
-    ax2.axis("off")
+    style_map_axis(ax2, "Suitability Classification\nHigh / Medium / Low")
 
     patches = [
         mpatches.Patch(color="#1A9850", label="High Suitability (≥ 0.65)"),
@@ -388,23 +398,15 @@ def plot_suitability(suitability, classified):
         mpatches.Patch(color="#D73027", label="Low (< 0.40)"),
     ]
     ax2.legend(handles=patches, loc="lower right",
-               fontsize=11, framealpha=0.9)
+               fontsize=8, framealpha=0.9)
 
-    # North arrow + scale bar on first panel
-    ax1.annotate('N', xy=(0.03, 0.95), xycoords='axes fraction',
-                 fontsize=14, fontweight='bold', ha='center', va='top')
-    ax1.annotate('', xy=(0.03, 0.97), xycoords='axes fraction',
-                 xytext=(0.03, 0.91), textcoords='axes fraction',
-                 arrowprops=dict(arrowstyle='->', lw=2, color='black'))
-    ax1.add_artist(ScaleBar(30, location='lower left', length_fraction=0.2,
-                            font_properties={'size': 10}))
+    add_north_arrow(ax1)
+    add_scale_bar(ax1)
 
     plt.suptitle("Hospital Site Suitability Analysis — Vellore 2024→2035",
                  fontsize=15, fontweight="bold")
     plt.tight_layout()
-    plt.savefig(MAPS_DIR / "suitability_map.png",
-                dpi=300, bbox_inches="tight")
-    plt.close()
+    save_publication_figure(fig, MAPS_DIR / "suitability_map.png")
     print("   🗺️  maps/suitability_map.png")
 
     return counts
@@ -418,7 +420,7 @@ def plot_weights_bar(weights, CR):
     colors = ["#E74C3C", "#3498DB", "#E67E22",
               "#2ECC71", "#9B59B6", "#1ABC9C"]
 
-    fig, ax = plt.subplots(figsize=(10, 6))
+    fig, ax = plt.subplots(figsize=(8, 6), dpi=300)
     bars = ax.bar(names, weights * 100, color=colors, edgecolor="black",
                   linewidth=0.8, alpha=0.9)
 
@@ -437,9 +439,7 @@ def plot_weights_bar(weights, CR):
     ax.spines["right"].set_visible(False)
 
     plt.tight_layout()
-    plt.savefig(MAPS_DIR / "ahp_weights_chart.png",
-                dpi=300, bbox_inches="tight")
-    plt.close()
+    save_publication_figure(fig, MAPS_DIR / "ahp_weights_chart.png")
     print("   🗺️  maps/ahp_weights_chart.png")
 
 
@@ -512,8 +512,8 @@ def main():
 
     # ── STEP 6: Maps ──────────────────────────────────────
     print("\n🗺️  Generating maps...")
-    plot_criteria_grid(criteria_list, criteria_names)
-    counts = plot_suitability(suitability, classified)
+    plot_criteria_grid(criteria_list, criteria_names, profile)
+    counts = plot_suitability(suitability, classified, profile)
     plot_weights_bar(weights, CR)
 
     # ── Summary ───────────────────────────────────────────
